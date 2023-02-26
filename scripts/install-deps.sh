@@ -26,11 +26,21 @@ if [[ "$OSTYPE" == "linux-gnu"* ]]; then
       rubygem-bundler \
       rubygem-sqlite3 \
       ruby-devel
+  elif [ "$ID" = "rocky" ]; then
+    dnf install -y \
+      libpq-devel \
+      libsqlite3x-devel \
+      nodejs \
+      npm \
+      protobuf-compiler \
+      rubygem-bundler \
+      rubygem-sqlite3 \
+      ruby-devel
   else
     echo "Linux distribution $ID is not supported by this installer."
   fi
 elif [[ "$OSTYPE" == "darwin"* ]]; then
   brew install protobuf
 else
-  echo "Your operating system is not supported by this installer."
+  echo "Your operating system "$OSTYPE" is not supported by this installer."
 fi
