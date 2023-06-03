@@ -4,8 +4,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tower::util::option_layer;
 
-use crate::database::service::DbFactory;
-use crate::replication::logger::ReplicationLogger;
+use crate::database::factory::DbFactory;
+use crate::database::Database;
+use crate::replication::ReplicationLogger;
 use crate::rpc::proxy::rpc::proxy_server::ProxyServer;
 use crate::rpc::proxy::ProxyService;
 use crate::rpc::replication_log::rpc::replication_log_server::ReplicationLogServer;
@@ -16,17 +17,17 @@ pub mod proxy;
 pub mod replication_log;
 
 #[allow(clippy::too_many_arguments)]
-pub async fn run_rpc_server(
+pub async fn run_rpc_server<D: Database>(
     addr: SocketAddr,
     tls: bool,
     cert_path: Option<PathBuf>,
     key_path: Option<PathBuf>,
     ca_cert_path: Option<PathBuf>,
-    factory: Arc<dyn DbFactory>,
+    factory: Arc<dyn DbFactory<Db = D>>,
     logger: Arc<ReplicationLogger>,
     idle_shutdown_layer: Option<IdleShutdownLayer>,
 ) -> anyhow::Result<()> {
-    let proxy_service = ProxyService::new(factory);
+    let proxy_service = ProxyService::new(factory, logger.new_frame_notifier.subscribe());
     let logger_service = ReplicationLogService::new(logger);
 
     tracing::info!("serving write proxy server at {addr}");

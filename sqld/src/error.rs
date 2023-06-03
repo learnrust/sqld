@@ -1,10 +1,12 @@
+use crate::query_result_builder::QueryResultBuilderError;
+
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("LibSQL failed to bind provided query parameters: `{0}`")]
     LibSqlInvalidQueryParams(anyhow::Error),
-    #[error("Transaction timed-out when evaluating query no. `{0}`")]
-    LibSqlTxTimeout(usize),
+    #[error("Transaction timed-out")]
+    LibSqlTxTimeout,
     #[error("Server can't handle additional transactions")]
     LibSqlTxBusy,
     #[error(transparent)]
@@ -21,6 +23,16 @@ pub enum Error {
     // Consider creating a dedicate enum value for your error.
     #[error("Internal Error: `{0}`")]
     Internal(String),
+    #[error("Invalid batch step: {0}")]
+    InvalidBatchStep(usize),
+    #[error("Not authorized to execute query: {0}")]
+    NotAuthorized(String),
+    #[error("The replicator exited, instance cannot make any progress.")]
+    ReplicatorExited,
+    #[error("Timed out while openning database connection")]
+    DbCreateTimeout,
+    #[error(transparent)]
+    BuilderError(#[from] QueryResultBuilderError),
 }
 
 impl From<tokio::sync::oneshot::error::RecvError> for Error {

@@ -4,17 +4,19 @@ on:
   push:
     branches: [ "main", "trying", "staging" ]
   pull_request:
+  merge_group:
     branches: [ "main" ]
 
 env:
   CARGO_TERM_COLOR: always
+  RUSTFLAGS: --cfg=uuid_unstable
 
 jobs:
   checks:
     runs-on: ubuntu-latest
     name: Run Checks
     env:
-      RUSTFLAGS: -D warnings
+      RUSTFLAGS: -D warnings --cfg=uuid_unstable
     steps:
       - name: Install Rust
         uses: actions-rs/toolchain@v1
@@ -114,8 +116,28 @@ jobs:
       with:
         command: test
         args: --verbose
-    - name: Run functional tests
-      run: make test
+
+  check-openssl:
+    runs-on: ubuntu-latest
+    name: Check that we don't depend on openssl
+    steps:
+    - name: Install minimal stable toolchain with clippy and rustfmt
+      uses: actions-rs/toolchain@v1
+      with:
+        profile: minimal
+        toolchain: stable
+        override: true
+    - name: Install Protoc
+      uses: arduino/setup-protoc@v1
+      with:
+        repo-token: ${{ secrets.GITHUB_TOKEN }}
+    - name: Checkout
+      uses: actions/checkout@v3
+      with:
+        submodules: recursive
+    - name: Test openssl
+      shell: bash {0}
+      run: cargo tree -p sqld -i openssl; [ $? = 101 ]
 
   docker:
     runs-on: ubuntu-latest

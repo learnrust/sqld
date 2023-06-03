@@ -1,53 +1,58 @@
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::Arc;
-#[cfg(feature = "mwal_backend")]
-use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::Context as AnyhowContext;
-use database::libsql::LibSqlDb;
-use database::service::DbFactoryService;
-use database::write_proxy::WriteProxyDbFactory;
+use futures::never::Never;
+use libsql::wal_hook::TRANSPARENT_METHODS;
 use once_cell::sync::Lazy;
-#[cfg(feature = "mwal_backend")]
-use once_cell::sync::OnceCell;
-use replication::logger::{ReplicationLogger, ReplicationLoggerHook};
 use rpc::run_rpc_server;
-use tokio::sync::Notify;
+use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinSet;
-use tower::load::Constant;
-use tower::ServiceExt;
+use tonic::transport::Channel;
 use utils::services::idle_shutdown::IdleShutdownLayer;
 
+use self::database::dump::loader::DumpLoader;
+use self::database::factory::DbFactory;
+use self::database::libsql::{open_db, LibSqlDbFactory};
+use self::database::write_proxy::WriteProxyDbFactory;
+use self::database::Database;
+use self::replication::primary::logger::{ReplicationLoggerHookCtx, REPLICATION_METHODS};
+use self::replication::ReplicationLogger;
 use crate::auth::Auth;
 use crate::error::Error;
-use crate::postgres::service::PgConnectionFactory;
-use crate::server::Server;
+use crate::replication::replica::Replicator;
+use crate::stats::Stats;
+
+use sha256::try_digest;
 
 pub use sqld_libsql_bindings as libsql;
 
 mod auth;
-mod database;
+pub mod database;
 mod error;
+mod heartbeat;
 mod hrana;
 mod http;
-mod postgres;
 mod query;
 mod query_analysis;
+mod query_result_builder;
 mod replication;
 pub mod rpc;
-mod server;
+mod stats;
 mod utils;
+
+const MAX_CONCCURENT_DBS: usize = 128;
+const DB_CREATE_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(clap::ValueEnum, Clone, Debug, PartialEq)]
 pub enum Backend {
     Libsql,
-    #[cfg(feature = "mwal_backend")]
-    Mwal,
 }
 
-type Result<T> = std::result::Result<T, Error>;
+type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Trigger a hard database reset. This cause the database to be wiped, freshly restarted
 /// This is used for replicas that are left in an unrecoverabe state and should restart from a
@@ -56,23 +61,16 @@ type Result<T> = std::result::Result<T, Error>;
 /// /!\ use with caution.
 pub(crate) static HARD_RESET: Lazy<Arc<Notify>> = Lazy::new(|| Arc::new(Notify::new()));
 
-#[cfg(feature = "mwal_backend")]
-pub(crate) static VWAL_METHODS: OnceCell<
-    Option<Arc<Mutex<sqld_libsql_bindings::mwal::ffi::libsql_wal_methods>>>,
-> = OnceCell::new();
-
 pub struct Config {
     pub db_path: PathBuf,
-    pub tcp_addr: Option<SocketAddr>,
-    pub ws_addr: Option<SocketAddr>,
+    pub extensions_path: Option<PathBuf>,
     pub http_addr: Option<SocketAddr>,
     pub enable_http_console: bool,
     pub http_auth: Option<String>,
+    pub http_self_url: Option<String>,
     pub hrana_addr: Option<SocketAddr>,
     pub auth_jwt_key: Option<String>,
     pub backend: Backend,
-    #[cfg(feature = "mwal_backend")]
-    pub mwal_addr: Option<String>,
     pub writer_rpc_addr: Option<String>,
     pub writer_rpc_tls: bool,
     pub writer_rpc_cert: Option<PathBuf>,
@@ -83,46 +81,100 @@ pub struct Config {
     pub rpc_server_cert: Option<PathBuf>,
     pub rpc_server_key: Option<PathBuf>,
     pub rpc_server_ca_cert: Option<PathBuf>,
+    #[cfg(feature = "bottomless")]
     pub enable_bottomless_replication: bool,
-    pub create_local_http_tunnel: bool,
     pub idle_shutdown_timeout: Option<Duration>,
+    pub load_from_dump: Option<PathBuf>,
+    pub max_log_size: u64,
+    pub heartbeat_url: Option<String>,
+    pub heartbeat_auth: Option<String>,
+    pub heartbeat_period: Duration,
+    pub soft_heap_limit_mb: Option<usize>,
+    pub hard_heap_limit_mb: Option<usize>,
 }
 
-async fn run_service(
-    service: DbFactoryService,
+async fn run_service<D: Database>(
+    db_factory: Arc<dyn DbFactory<Db = D>>,
     config: &Config,
     join_set: &mut JoinSet<anyhow::Result<()>>,
     idle_shutdown_layer: Option<IdleShutdownLayer>,
+    stats: Stats,
 ) -> anyhow::Result<()> {
     let auth = get_auth(config)?;
 
-    let mut server = Server::new();
-    if let Some(addr) = config.tcp_addr {
-        server.bind_tcp(addr).await?;
-    }
-    if let Some(addr) = config.ws_addr {
-        server.bind_ws(addr).await?;
-    }
+    let (hrana_accept_tx, hrana_accept_rx) = mpsc::channel(8);
+    let (hrana_upgrade_tx, hrana_upgrade_rx) = mpsc::channel(8);
 
-    let factory = PgConnectionFactory::new(service.clone());
-    join_set.spawn(server.serve(factory));
+    if config.http_addr.is_some() || config.hrana_addr.is_some() {
+        let db_factory = db_factory.clone();
+        let auth = auth.clone();
+        let idle_kicker = idle_shutdown_layer.clone().map(|isl| isl.into_kicker());
+        join_set.spawn(async move {
+            hrana::ws::serve(
+                db_factory,
+                auth,
+                idle_kicker,
+                hrana_accept_rx,
+                hrana_upgrade_rx,
+            )
+            .await
+            .context("Hrana server failed")
+        });
+    }
 
     if let Some(addr) = config.http_addr {
+        let hrana_http_srv = Arc::new(hrana::http::Server::new(
+            db_factory.clone(),
+            config.http_self_url.clone(),
+        ));
         join_set.spawn(http::run_http(
             addr,
-            auth.clone(),
-            service.clone().map_response(|s| Constant::new(s, 1)),
+            auth,
+            db_factory,
+            hrana_upgrade_tx,
+            hrana_http_srv.clone(),
             config.enable_http_console,
             idle_shutdown_layer,
+            stats.clone(),
         ));
+        join_set.spawn(async move {
+            hrana_http_srv.run_expire().await;
+            Ok(())
+        });
     }
 
     if let Some(addr) = config.hrana_addr {
         join_set.spawn(async move {
-            hrana::serve(service.factory, addr, auth)
+            hrana::ws::listen(addr, hrana_accept_tx)
                 .await
-                .context("Hrana server failed")
+                .context("Hrana listener failed")
         });
+    }
+
+    match &config.heartbeat_url {
+        Some(heartbeat_url) => {
+            let heartbeat_period = config.heartbeat_period;
+            tracing::info!(
+                "Server sending heartbeat to URL {} every {:?}",
+                heartbeat_url,
+                heartbeat_period,
+            );
+            let heartbeat_url = heartbeat_url.clone();
+            let heartbeat_auth = config.heartbeat_auth.clone();
+            join_set.spawn(async move {
+                heartbeat::server_heartbeat(
+                    heartbeat_url,
+                    heartbeat_auth,
+                    heartbeat_period,
+                    stats.clone(),
+                )
+                .await;
+                Ok(())
+            });
+        }
+        None => {
+            tracing::warn!("No server heartbeat configured")
+        }
     }
 
     Ok(())
@@ -132,9 +184,10 @@ fn get_auth(config: &Config) -> anyhow::Result<Arc<Auth>> {
     let mut auth = Auth::default();
 
     if let Some(arg) = config.http_auth.as_deref() {
-        let param = auth::parse_http_basic_auth_arg(arg)?;
-        auth.http_basic = Some(param);
-        tracing::info!("Using legacy HTTP basic authentication");
+        if let Some(param) = auth::parse_http_basic_auth_arg(arg)? {
+            auth.http_basic = Some(param);
+            tracing::info!("Using legacy HTTP basic authentication");
+        }
     }
 
     if let Some(jwt_key) = config.auth_jwt_key.as_deref() {
@@ -168,49 +221,213 @@ async fn hard_reset(
     Ok(())
 }
 
-async fn start_primary(
-    config: &Config,
-    join_set: &mut JoinSet<anyhow::Result<()>>,
-    addr: &str,
-    idle_shutdown_layer: Option<IdleShutdownLayer>,
-) -> anyhow::Result<()> {
-    let (factory, handle) = WriteProxyDbFactory::new(
-        addr,
-        config.writer_rpc_tls,
-        config.writer_rpc_cert.clone(),
-        config.writer_rpc_key.clone(),
-        config.writer_rpc_ca_cert.clone(),
-        config.db_path.clone(),
-    )
-    .await
-    .context("failed to start WriteProxy DB")?;
+fn configure_rpc(config: &Config) -> anyhow::Result<(Channel, tonic::transport::Uri)> {
+    let mut endpoint = Channel::from_shared(config.writer_rpc_addr.clone().unwrap())?;
+    if config.writer_rpc_tls {
+        let cert_pem = std::fs::read_to_string(config.writer_rpc_cert.clone().unwrap())?;
+        let key_pem = std::fs::read_to_string(config.writer_rpc_key.clone().unwrap())?;
+        let identity = tonic::transport::Identity::from_pem(cert_pem, key_pem);
 
-    // the `JoinSet` does not support inserting arbitrary `JoinHandles` (and it also does not
-    // support spawning blocking tasks, so we must spawn a proxy task to add the `handle` to
-    // `join_set`
-    join_set.spawn(async move { handle.await.expect("WriteProxy DB task failed") });
+        let ca_cert_pem = std::fs::read_to_string(config.writer_rpc_ca_cert.clone().unwrap())?;
+        let ca_cert = tonic::transport::Certificate::from_pem(ca_cert_pem);
 
-    let service = DbFactoryService::new(Arc::new(factory));
-    run_service(service, config, join_set, idle_shutdown_layer).await?;
+        let tls_config = tonic::transport::ClientTlsConfig::new()
+            .identity(identity)
+            .ca_certificate(ca_cert)
+            .domain_name("sqld");
+        endpoint = endpoint.tls_config(tls_config)?;
+    }
 
-    Ok(())
+    let channel = endpoint.connect_lazy();
+    let uri = tonic::transport::Uri::from_maybe_shared(config.writer_rpc_addr.clone().unwrap())?;
+
+    Ok((channel, uri))
 }
 
 async fn start_replica(
     config: &Config,
     join_set: &mut JoinSet<anyhow::Result<()>>,
     idle_shutdown_layer: Option<IdleShutdownLayer>,
+    stats: Stats,
 ) -> anyhow::Result<()> {
-    let logger = Arc::new(ReplicationLogger::open(&config.db_path)?);
-    let logger_clone = logger.clone();
-    let path_clone = config.db_path.clone();
-    let enable_bottomless = config.enable_bottomless_replication;
-    let db_factory = Arc::new(move || {
-        let db_path = path_clone.clone();
-        let hook = ReplicationLoggerHook::new(logger.clone());
-        async move { LibSqlDb::new(db_path, hook, enable_bottomless) }
-    });
-    let service = DbFactoryService::new(db_factory.clone());
+    let (channel, uri) = configure_rpc(config)?;
+    let replicator = Replicator::new(config.db_path.clone(), channel.clone(), uri.clone());
+    let applied_frame_no_receiver = replicator.current_frame_no_notifier.subscribe();
+
+    join_set.spawn(replicator.run());
+
+    let valid_extensions = validate_extensions(config.extensions_path.clone())?;
+
+    let factory = WriteProxyDbFactory::new(
+        config.db_path.clone(),
+        valid_extensions,
+        channel,
+        uri,
+        stats.clone(),
+        applied_frame_no_receiver,
+    )
+    .throttled(MAX_CONCCURENT_DBS, Some(DB_CREATE_TIMEOUT));
+
+    run_service(
+        Arc::new(factory),
+        config,
+        join_set,
+        idle_shutdown_layer,
+        stats,
+    )
+    .await?;
+
+    Ok(())
+}
+
+fn check_fresh_db(path: &Path) -> bool {
+    !path.join("wallog").exists()
+}
+
+fn validate_extensions(extensions_path: Option<PathBuf>) -> anyhow::Result<Vec<PathBuf>> {
+    let mut valid_extensions = vec![];
+    if let Some(ext_dir) = extensions_path {
+        let extensions_list = ext_dir.join("trusted.lst");
+
+        let file_contents = std::fs::read_to_string(&extensions_list)
+            .with_context(|| format!("can't read {}", &extensions_list.display()))?;
+
+        let extensions = file_contents.lines().filter(|c| !c.is_empty());
+
+        for line in extensions {
+            let mut ext_info = line.trim().split_ascii_whitespace();
+
+            let ext_sha = ext_info.next().ok_or_else(|| {
+                anyhow::anyhow!("invalid line on {}: {}", &extensions_list.display(), line)
+            })?;
+            let ext_fname = ext_info.next().ok_or_else(|| {
+                anyhow::anyhow!("invalid line on {}: {}", &extensions_list.display(), line)
+            })?;
+
+            anyhow::ensure!(
+                ext_info.next().is_none(),
+                "extension list seem to contain a filename with whitespaces. Rejected"
+            );
+
+            let extension_full_path = ext_dir.join(ext_fname);
+            let digest = try_digest(extension_full_path.as_path()).with_context(|| {
+                format!(
+                    "Failed to get sha256 digest, while trying to read {}",
+                    extension_full_path.display()
+                )
+            })?;
+
+            anyhow::ensure!(
+                digest == ext_sha,
+                "sha256 differs for {}. Got {}",
+                ext_fname,
+                digest
+            );
+            valid_extensions.push(extension_full_path);
+        }
+    }
+    Ok(valid_extensions)
+}
+
+#[cfg(feature = "bottomless")]
+pub async fn init_bottomless_replicator(
+    path: impl AsRef<std::path::Path>,
+) -> anyhow::Result<bottomless::replicator::Replicator> {
+    tracing::debug!("Initializing bottomless replication");
+    let mut replicator =
+        bottomless::replicator::Replicator::create(bottomless::replicator::Options {
+            create_bucket_if_not_exists: true,
+            verify_crc: false,
+            use_compression: false,
+        })
+        .await?;
+
+    // NOTICE: LIBSQL_BOTTOMLESS_DATABASE_ID env variable can be used
+    // to pass an additional prefix for the database identifier
+    replicator.register_db(
+        path.as_ref()
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("Invalid db path"))?
+            .to_owned(),
+    );
+
+    match replicator.restore().await? {
+        bottomless::replicator::RestoreAction::None => (),
+        bottomless::replicator::RestoreAction::SnapshotMainDbFile => {
+            replicator.new_generation();
+            replicator.snapshot_main_db_file().await?;
+            // Restoration process only leaves the local WAL file if it was
+            // detected to be newer than its remote counterpart.
+            replicator.maybe_replicate_wal().await?
+        }
+        bottomless::replicator::RestoreAction::ReuseGeneration(gen) => {
+            replicator.set_generation(gen);
+        }
+    }
+
+    Ok(replicator)
+}
+
+async fn start_primary(
+    config: &Config,
+    join_set: &mut JoinSet<anyhow::Result<()>>,
+    idle_shutdown_layer: Option<IdleShutdownLayer>,
+    stats: Stats,
+) -> anyhow::Result<()> {
+    let is_fresh_db = check_fresh_db(&config.db_path);
+    let logger = Arc::new(ReplicationLogger::open(
+        &config.db_path,
+        config.max_log_size,
+    )?);
+
+    #[cfg(feature = "bottomless")]
+    let bottomless_replicator = if config.enable_bottomless_replication {
+        Some(Arc::new(std::sync::Mutex::new(
+            init_bottomless_replicator(config.db_path.join("data")).await?,
+        )))
+    } else {
+        None
+    };
+
+    // load dump is necessary
+    let dump_loader = DumpLoader::new(
+        config.db_path.clone(),
+        logger.clone(),
+        #[cfg(feature = "bottomless")]
+        bottomless_replicator.clone(),
+    )
+    .await?;
+    if let Some(ref path) = config.load_from_dump {
+        if !is_fresh_db {
+            anyhow::bail!("cannot load from a dump if a database already exists.\nIf you're sure you want to load from a dump, delete your database folder at `{}`", config.db_path.display());
+        }
+        dump_loader.load_dump(path.into()).await?;
+    }
+
+    let valid_extensions = validate_extensions(config.extensions_path.clone())?;
+
+    let db_factory: Arc<_> = LibSqlDbFactory::new(
+        config.db_path.clone(),
+        &REPLICATION_METHODS,
+        {
+            let logger = logger.clone();
+            #[cfg(feature = "bottomless")]
+            let bottomless_replicator = bottomless_replicator.clone();
+            move || {
+                ReplicationLoggerHookCtx::new(
+                    logger.clone(),
+                    #[cfg(feature = "bottomless")]
+                    bottomless_replicator.clone(),
+                )
+            }
+        },
+        stats.clone(),
+        valid_extensions,
+    )
+    .await?
+    .throttled(MAX_CONCCURENT_DBS, Some(DB_CREATE_TIMEOUT))
+    .into();
+
     if let Some(ref addr) = config.rpc_server_addr {
         join_set.spawn(run_rpc_server(
             *addr,
@@ -218,13 +435,61 @@ async fn start_replica(
             config.rpc_server_cert.clone(),
             config.rpc_server_key.clone(),
             config.rpc_server_ca_cert.clone(),
-            db_factory,
-            logger_clone,
+            db_factory.clone(),
+            logger,
             idle_shutdown_layer.clone(),
         ));
     }
 
-    run_service(service, config, join_set, idle_shutdown_layer).await?;
+    run_service(db_factory, config, join_set, idle_shutdown_layer, stats).await?;
+
+    Ok(())
+}
+
+// Periodically check the storage used by the database and save it in the Stats structure.
+// TODO: Once we have a separate fiber that does WAL checkpoints, running this routine
+// right after checkpointing is exactly where it should be done.
+async fn run_storage_monitor(db_path: PathBuf, stats: Stats) -> anyhow::Result<()> {
+    let (_drop_guard, exit_notify) = std::sync::mpsc::channel::<Never>();
+    let _ = tokio::task::spawn_blocking(move || {
+        let duration = tokio::time::Duration::from_secs(60);
+        loop {
+            // because closing the last connection interferes with opening a new one, we lazily
+            // initialize a connection here, and keep it alive for the entirety of the program. If we
+            // fail to open it, we wait for `duration` and try again later.
+            let ctx = &mut ();
+            let maybe_conn = match open_db(&db_path, &TRANSPARENT_METHODS, ctx, Some(rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)) {
+                Ok(conn) => Some(conn),
+                Err(e) => {
+                    tracing::warn!("failed to open connection for storager monitor: {e}, trying again in {duration:?}");
+                    None
+                },
+            };
+
+            loop {
+                if let Some(ref conn) = maybe_conn {
+                    if let Ok(storage_bytes_used) =
+                        conn.query_row("select sum(pgsize) from dbstat;", [], |row| {
+                            row.get::<usize, u64>(0)
+                        })
+                    {
+                        stats.set_storage_bytes_used(storage_bytes_used);
+                    }
+                }
+
+                match exit_notify.recv_timeout(duration) {
+                    Ok(_) => unreachable!(),
+                    Err(RecvTimeoutError::Disconnected) => return,
+                    Err(RecvTimeoutError::Timeout) => (),
+
+                }
+
+                if maybe_conn.is_none() {
+                    break
+                }
+            }
+        }
+    }).await;
 
     Ok(())
 }
@@ -232,37 +497,22 @@ async fn start_replica(
 pub async fn run_server(config: Config) -> anyhow::Result<()> {
     tracing::trace!("Backend: {:?}", config.backend);
 
-    #[cfg(feature = "mwal_backend")]
-    {
-        if config.backend == Backend::Mwal {
-            std::env::set_var("MVSQLITE_DATA_PLANE", config.mwal_addr.as_ref().unwrap());
-        }
-        VWAL_METHODS
-            .set(config.mwal_addr.as_ref().map(|_| {
-                Arc::new(Mutex::new(
-                    sqld_libsql_bindings::mwal::ffi::libsql_wal_methods::new(),
-                ))
-            }))
-            .map_err(|_| anyhow::anyhow!("wal_methods initialized twice"))?;
-    }
-
+    #[cfg(feature = "bottomless")]
     if config.enable_bottomless_replication {
         bottomless::static_init::register_bottomless_methods();
     }
 
-    let (local_tunnel_shutdown, _) = localtunnel_client::broadcast::channel(1);
-    if config.create_local_http_tunnel {
-        let tunnel = localtunnel_client::open_tunnel(
-            Some("https://localtunnel.me"),
-            None,
-            config.http_addr.map(|a| a.ip().to_string()).as_deref(),
-            config.http_addr.map(|a| a.port()).unwrap_or(8080),
-            local_tunnel_shutdown.clone(),
-            3,
-            None,
-        )
-        .await?;
-        println!("HTTP tunnel created: {tunnel}");
+    if let Some(soft_limit_mb) = config.soft_heap_limit_mb {
+        tracing::warn!("Setting soft heap limit to {soft_limit_mb}MiB");
+        unsafe {
+            sqld_libsql_bindings::ffi::sqlite3_soft_heap_limit64(soft_limit_mb as i64 * 1024 * 1024)
+        };
+    }
+    if let Some(hard_limit_mb) = config.hard_heap_limit_mb {
+        tracing::warn!("Setting hard heap limit to {hard_limit_mb}MiB");
+        unsafe {
+            sqld_libsql_bindings::ffi::sqlite3_hard_heap_limit64(hard_limit_mb as i64 * 1024 * 1024)
+        };
     }
 
     loop {
@@ -276,11 +526,19 @@ pub async fn run_server(config: Config) -> anyhow::Result<()> {
             .idle_shutdown_timeout
             .map(|d| IdleShutdownLayer::new(d, shutdown_notify.clone()));
 
+        let stats = Stats::new(&config.db_path)?;
+
         match config.writer_rpc_addr {
-            Some(ref addr) => {
-                start_primary(&config, &mut join_set, addr, idle_shutdown_layer).await?
+            Some(_) => {
+                start_replica(&config, &mut join_set, idle_shutdown_layer, stats.clone()).await?
             }
-            None => start_replica(&config, &mut join_set, idle_shutdown_layer).await?,
+            None => {
+                start_primary(&config, &mut join_set, idle_shutdown_layer, stats.clone()).await?
+            }
+        }
+
+        if config.heartbeat_url.is_some() {
+            join_set.spawn(run_storage_monitor(config.db_path.clone(), stats));
         }
 
         let reset = HARD_RESET.clone();
@@ -291,6 +549,7 @@ pub async fn run_server(config: Config) -> anyhow::Result<()> {
                     break;
                 },
                 _ = shutdown_notify.notified() => {
+                    join_set.shutdown().await;
                     return Ok(())
                 }
                 Some(res) = join_set.join_next() => {

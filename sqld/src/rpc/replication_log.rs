@@ -7,10 +7,14 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 
+use futures::stream::BoxStream;
+use futures::StreamExt;
+use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Status;
 
-use crate::replication::logger::{FrameId, ReplicationLogger};
+use crate::replication::primary::frame_stream::FrameStream;
+use crate::replication::{LogReadError, ReplicationLogger};
 
 use self::rpc::replication_log_server::ReplicationLog;
 use self::rpc::{Frame, HelloRequest, HelloResponse, LogOffset};
@@ -21,6 +25,7 @@ pub struct ReplicationLogService {
 }
 
 pub const NO_HELLO_ERROR_MSG: &str = "NO_HELLO";
+pub const NEED_SNAPSHOT_ERROR_MSG: &str = "NEED_SNAPSHOT";
 
 impl ReplicationLogService {
     pub fn new(logger: Arc<ReplicationLogger>) -> Self {
@@ -29,34 +34,32 @@ impl ReplicationLogService {
             replicas_with_hello: RwLock::new(HashSet::<SocketAddr>::new()),
         }
     }
+}
 
-    fn stream_pages(&self, start_id: FrameId) -> ReceiverStream<Result<Frame, Status>> {
-        let logger = self.logger.clone();
-        let (sender, receiver) = tokio::sync::mpsc::channel(64);
-        tokio::task::spawn_blocking(move || {
-            let mut offset = start_id;
-            loop {
-                match logger.frame_bytes(offset) {
-                    Ok(None) => break,
-                    Ok(Some(data)) => {
-                        if let Err(e) = sender.blocking_send(Ok(Frame { data })) {
-                            tracing::error!("failed to send frame: {e}");
-                            break;
-                        }
-                        offset += 1;
-                    }
-                    Err(e) => todo!("{e}"),
-                }
-            }
-        });
-
-        ReceiverStream::new(receiver)
+fn map_frame_stream_output(
+    r: Result<crate::replication::frame::Frame, LogReadError>,
+) -> Result<Frame, Status> {
+    match r {
+        Ok(frame) => Ok(Frame {
+            data: frame.bytes(),
+        }),
+        Err(LogReadError::SnapshotRequired) => Err(Status::new(
+            tonic::Code::FailedPrecondition,
+            NEED_SNAPSHOT_ERROR_MSG,
+        )),
+        Err(LogReadError::Error(e)) => Err(Status::new(tonic::Code::Internal, e.to_string())),
+        // this error should be caught before, but we handle it nicely anyways
+        Err(LogReadError::Ahead) => Err(Status::new(
+            tonic::Code::OutOfRange,
+            "frame not yet available",
+        )),
     }
 }
 
 #[tonic::async_trait]
 impl ReplicationLog for ReplicationLogService {
-    type LogEntriesStream = ReceiverStream<Result<Frame, Status>>;
+    type LogEntriesStream = BoxStream<'static, Result<Frame, Status>>;
+    type SnapshotStream = BoxStream<'static, Result<Frame, Status>>;
 
     async fn log_entries(
         &self,
@@ -71,9 +74,11 @@ impl ReplicationLog for ReplicationLogService {
                 return Err(Status::failed_precondition(NO_HELLO_ERROR_MSG));
             }
         }
-        // if current_offset is None, then start sending from 0, otherwise return next frame
-        let start_offset = req.into_inner().current_offset.map(|x| x + 1).unwrap_or(0);
-        let stream = self.stream_pages(start_offset as _);
+
+        let stream = FrameStream::new(self.logger.clone(), req.into_inner().next_offset)
+            .map(map_frame_stream_output)
+            .boxed();
+
         Ok(tonic::Response::new(stream))
     }
 
@@ -89,11 +94,49 @@ impl ReplicationLog for ReplicationLogService {
             guard.insert(replica_addr);
         }
         let response = HelloResponse {
-            database_id: self.logger.database_id.to_string(),
+            database_id: self.logger.database_id().unwrap().to_string(),
             generation_start_index: self.logger.generation.start_index,
             generation_id: self.logger.generation.id.to_string(),
         };
 
         Ok(tonic::Response::new(response))
+    }
+
+    async fn snapshot(
+        &self,
+        req: tonic::Request<LogOffset>,
+    ) -> Result<tonic::Response<Self::SnapshotStream>, Status> {
+        let (sender, receiver) = mpsc::channel(10);
+        let logger = self.logger.clone();
+        let offset = req.into_inner().next_offset;
+        match tokio::task::spawn_blocking(move || logger.get_snapshot_file(offset)).await {
+            Ok(Ok(Some(snapshot))) => {
+                tokio::task::spawn_blocking(move || {
+                    let mut frames = snapshot.frames_iter_from(offset);
+                    loop {
+                        match frames.next() {
+                            Some(Ok(data)) => {
+                                let _ = sender.blocking_send(Ok(Frame { data }));
+                            }
+                            Some(Err(e)) => {
+                                let _ = sender.blocking_send(Err(Status::new(
+                                    tonic::Code::Internal,
+                                    e.to_string(),
+                                )));
+                                break;
+                            }
+                            None => {
+                                break;
+                            }
+                        }
+                    }
+                });
+
+                Ok(tonic::Response::new(ReceiverStream::new(receiver).boxed()))
+            }
+            Ok(Ok(None)) => Err(Status::new(tonic::Code::Unavailable, "snapshot not found")),
+            Err(e) => Err(Status::new(tonic::Code::Internal, e.to_string())),
+            Ok(Err(e)) => Err(Status::new(tonic::Code::Internal, e.to_string())),
+        }
     }
 }

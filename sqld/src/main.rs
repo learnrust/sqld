@@ -1,23 +1,38 @@
-use std::{env, fs, net::SocketAddr, path::PathBuf, time::Duration};
+use std::env;
+use std::fs::{self, OpenOptions};
+use std::io::{stdout, Write};
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{bail, Context as _, Result};
 use clap::Parser;
-use sqld::Config;
+use mimalloc::MiMalloc;
+use sqld::{database::dump::exporter::export_dump, Config};
 use tracing_subscriber::filter::LevelFilter;
+use tracing_subscriber::prelude::__tracing_subscriber_SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::Layer;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 /// SQL daemon
 #[derive(Debug, Parser)]
 #[command(name = "sqld")]
-#[command(about = "SQL daemon", long_about = None)]
+#[command(about = "SQL daemon", version, long_about = None)]
 struct Cli {
     #[clap(long, short, default_value = "data.sqld", env = "SQLD_DB_PATH")]
     db_path: PathBuf,
-    /// The address and port the PostgreSQL server listens to.
-    #[clap(long, short, env = "SQLD_PG_LISTEN_ADDR")]
-    pg_listen_addr: Option<SocketAddr>,
-    /// The address and port the PostgreSQL over WebSocket server listens to.
-    #[clap(long, short, env = "SQLD_WS_LISTEN_ADDR")]
-    ws_listen_addr: Option<SocketAddr>,
+
+    /// The directory path where trusted extensions can be loaded from.
+    /// If not present, extension loading is disabled.
+    /// If present, the directory is expected to have a trusted.lst file containing
+    /// the sha256 and name of each extension, one per line. Example:
+    ///
+    /// 99890762817735984843bf5cf02a4b2ea648018fd05f04df6f9ce7f976841510  math.dylib
+    #[clap(long, short)]
+    extensions_path: Option<PathBuf>,
 
     #[clap(long, default_value = "127.0.0.1:8080", env = "SQLD_HTTP_LISTEN_ADDR")]
     http_listen_addr: SocketAddr,
@@ -39,6 +54,10 @@ struct Cli {
     /// where $PARAM is base64-encoded string "$USERNAME:$PASSWORD".
     #[clap(long, env = "SQLD_HTTP_AUTH")]
     http_auth: Option<String>,
+    /// URL that points to the HTTP API of this server. If set, this is used to implement "sticky
+    /// sessions" in Hrana over HTTP.
+    #[clap(long, env = "SQLD_HTTP_SELF_URL")]
+    http_self_url: Option<String>,
 
     /// The address and port the inter-node RPC protocol listens to. Example: `0.0.0.0:5001`.
     #[clap(
@@ -86,24 +105,65 @@ struct Cli {
         env = "SQLD_BACKEND"
     )]
     backend: sqld::Backend,
-    // The url to connect with mWAL backend, based on mvSQLite
-    #[cfg(feature = "mwal_backend")]
-    #[clap(long, short, env = "SQLD_MWAL_ADDR")]
-    mwal_addr: Option<String>,
 
     /// Don't display welcome message
     #[clap(long)]
     no_welcome: bool,
+    #[cfg(feature = "bottomless")]
     #[clap(long, env = "SQLD_ENABLE_BOTTOMLESS_REPLICATION")]
     enable_bottomless_replication: bool,
-    /// Create a tunnel for the HTTP interface, available publicly via the https://localtunnel.me interface. The tunnel URL will be printed to stdin
-    #[clap(long, env = "SQLD_CREATE_LOCAL_HTTP_TUNNEL")]
-    create_local_http_tunnel: bool,
     /// The duration, in second, after which to shutdown the server if no request have been
     /// received.
     /// By default, the server doesn't shutdown when idle.
     #[clap(long, env = "SQLD_IDLE_SHUTDOWN_TIMEOUT_S")]
     idle_shutdown_timeout_s: Option<u64>,
+
+    /// Load the dump at the provided path.
+    /// Requires that the node is not in replica mode
+    #[clap(long, env = "SQLD_LOAD_DUMP_PATH", conflicts_with = "primary_grpc_url")]
+    load_from_dump: Option<PathBuf>,
+
+    /// Maximum size the replication log is allowed to grow (in MB).
+    /// defaults to 200MB.
+    #[clap(long, env = "SQLD_MAX_LOG_SIZE", default_value = "200")]
+    max_log_size: u64,
+
+    #[clap(subcommand)]
+    utils: Option<UtilsSubcommands>,
+
+    /// The URL to send a server heartbeat `POST` request to.
+    /// By default, the server doesn't send a heartbeat.
+    #[clap(long, env = "SQLD_HEARTBEAT_URL")]
+    heartbeat_url: Option<String>,
+
+    /// The HTTP "Authornization" header to include in the a server heartbeat
+    /// `POST` request.
+    /// By default, the server doesn't send a heartbeat.
+    #[clap(long, env = "SQLD_HEARTBEAT_AUTH")]
+    heartbeat_auth: Option<String>,
+
+    /// The heartbeat time period in seconds.
+    /// By default, the the period is 30 seconds.
+    #[clap(long, env = "SQLD_HEARTBEAT_PERIOD_S", default_value = "30")]
+    heartbeat_period_s: u64,
+
+    /// Soft heap size limit in mebibytes - libSQL will try to not go over this limit with memory usage.
+    #[clap(long, env = "SQLD_SOFT_HEAP_LIMIT_MB")]
+    soft_heap_limit_mb: Option<usize>,
+
+    /// Hard heap size limit in mebibytes - libSQL will bail out with SQLITE_NOMEM error
+    /// if it goes over this limit with memory usage.
+    #[clap(long, env = "SQLD_HARD_HEAP_LIMIT_MB")]
+    hard_heap_limit_mb: Option<usize>,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum UtilsSubcommands {
+    Dump {
+        #[clap(long)]
+        /// Path at which to write the dump
+        path: Option<PathBuf>,
+    },
 }
 
 impl Cli {
@@ -112,21 +172,20 @@ impl Cli {
         // no welcome :'(
         if self.no_welcome { return }
 
-        eprintln!(r#"_____/\\\\\\\\\\\__________/\\\________/\\\______________/\\\\\\\\\\\\____        "#);
-        eprintln!(r#" ___/\\\/////////\\\_____/\\\\/\\\\____\/\\\_____________\/\\\////////\\\__       "#);
-        eprintln!(r#"  __\//\\\______\///____/\\\//\////\\\__\/\\\_____________\/\\\______\//\\\_      "#);
-        eprintln!(r#"   ___\////\\\__________/\\\______\//\\\_\/\\\_____________\/\\\_______\/\\\_     "#);
-        eprintln!(r#"    ______\////\\\______\//\\\______/\\\__\/\\\_____________\/\\\_______\/\\\_    "#);
-        eprintln!(r#"     _________\////\\\____\///\\\\/\\\\/___\/\\\_____________\/\\\_______\/\\\_   "#);
-        eprintln!(r#"      __/\\\______\//\\\_____\////\\\//_____\/\\\_____________\/\\\_______/\\\__  "#);
-        eprintln!(r#"       _\///\\\\\\\\\\\/_________\///\\\\\\__\/\\\\\\\\\\\\\\\_\/\\\\\\\\\\\\/___ "#);
-        eprintln!(r#"        ___\///////////_____________\//////___\///////////////__\////////////_____"#);
+        eprintln!(r#"           _     _ "#);
+        eprintln!(r#" ___  __ _| | __| |"#);
+        eprintln!(r#"/ __|/ _` | |/ _` |"#);
+        eprintln!(r#"\__ \ (_| | | (_| |"#);
+        eprintln!(r#"|___/\__, |_|\__,_|"#);
+        eprintln!(r#"        |_|        "#);
 
         eprintln!();
         eprintln!("Welcome to sqld!");
         eprintln!();
-        eprintln!("version: {}", env!("VERGEN_BUILD_SEMVER"));
-        eprintln!("commit SHA: {}", env!("VERGEN_GIT_SHA"));
+        eprintln!("version: {}", env!("CARGO_PKG_VERSION"));
+        if env!("VERGEN_GIT_SHA") != "VERGEN_IDEMPOTENT_OUTPUT" {
+            eprintln!("commit SHA: {}", env!("VERGEN_GIT_SHA"));
+        }
         eprintln!("build date: {}", env!("VERGEN_BUILD_DATE"));
         eprintln!();
         eprintln!("This software is in BETA version.");
@@ -143,10 +202,9 @@ impl Cli {
             _ => unreachable!("invalid configuration!"),
         };
         eprintln!("\t- database path: {}", self.db_path.display());
+        let extensions_str = self.extensions_path.clone().map_or("<disabled>".to_string(), |x| x.display().to_string());
+        eprintln!("\t- extensions path: {extensions_str}");
         eprintln!("\t- listening for HTTP requests on: {}", self.http_listen_addr);
-        if let Some(ref addr) = self.pg_listen_addr {
-            eprintln!("\t- listening for PostgreSQL wire on: {addr}");
-        }
         eprintln!("\t- grpc_tls: {}", if self.grpc_tls { "yes" } else { "no" });
     }
 }
@@ -167,13 +225,13 @@ fn config_from_args(args: Cli) -> Result<Config> {
 
     Ok(Config {
         db_path: args.db_path,
-        tcp_addr: args.pg_listen_addr,
-        ws_addr: args.ws_listen_addr,
+        extensions_path: args.extensions_path,
         http_addr: Some(args.http_listen_addr),
         enable_http_console: args.enable_http_console,
         hrana_addr: args.hrana_listen_addr,
         auth_jwt_key,
         http_auth: args.http_auth,
+        http_self_url: args.http_self_url,
         backend: args.backend,
         writer_rpc_addr: args.primary_grpc_url,
         writer_rpc_tls: args.primary_grpc_tls,
@@ -185,43 +243,94 @@ fn config_from_args(args: Cli) -> Result<Config> {
         rpc_server_cert: args.grpc_cert_file,
         rpc_server_key: args.grpc_key_file,
         rpc_server_ca_cert: args.grpc_ca_cert_file,
-        #[cfg(feature = "mwal_backend")]
-        mwal_addr: args.mwal_addr,
+        #[cfg(feature = "bottomless")]
         enable_bottomless_replication: args.enable_bottomless_replication,
-        create_local_http_tunnel: args.create_local_http_tunnel,
         idle_shutdown_timeout: args.idle_shutdown_timeout_s.map(Duration::from_secs),
+        load_from_dump: args.load_from_dump,
+        max_log_size: args.max_log_size,
+        heartbeat_url: args.heartbeat_url,
+        heartbeat_auth: args.heartbeat_auth,
+        heartbeat_period: Duration::from_secs(args.heartbeat_period_s),
+        soft_heap_limit_mb: args.soft_heap_limit_mb,
+        hard_heap_limit_mb: args.hard_heap_limit_mb,
     })
+}
+
+fn perform_dump(dump_path: Option<&Path>, db_path: &Path) -> anyhow::Result<()> {
+    let out: Box<dyn Write> = match dump_path {
+        Some(path) => {
+            let f = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(path)
+                .with_context(|| format!("file `{}` already exists", path.display()))?;
+            Box::new(f)
+        }
+        None => Box::new(stdout()),
+    };
+    let conn = rusqlite::Connection::open(db_path.join("data"))?;
+
+    export_dump(conn, out)?;
+
+    Ok(())
+}
+
+#[cfg(feature = "debug-tools")]
+fn enable_libsql_logging() {
+    use std::ffi::c_int;
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+
+    fn libsql_log(code: c_int, msg: &str) {
+        tracing::error!("sqlite error {code}: {msg}");
+    }
+
+    ONCE.call_once(|| unsafe {
+        rusqlite::trace::config_log(Some(libsql_log)).unwrap();
+    });
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::builder()
-                .with_default_directive(LevelFilter::INFO.into())
-                .from_env_lossy(),
+    let registry = tracing_subscriber::registry();
+
+    #[cfg(feature = "debug-tools")]
+    let registry = registry.with(console_subscriber::spawn());
+
+    #[cfg(feature = "debug-tools")]
+    enable_libsql_logging();
+
+    registry
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_filter(
+                    tracing_subscriber::EnvFilter::builder()
+                        .with_default_directive(LevelFilter::INFO.into())
+                        .from_env_lossy(),
+                ),
         )
         .init();
+
     let args = Cli::parse();
-    args.print_welcome_message();
 
-    #[cfg(feature = "mwal_backend")]
-    match (&args.backend, args.mwal_addr.is_some()) {
-        (sqld::Backend::Mwal, false) => {
-            anyhow::bail!("--mwal-addr parameter must be present with mwal backend")
+    match args.utils {
+        Some(UtilsSubcommands::Dump { path }) => {
+            if let Some(ref path) = path {
+                eprintln!(
+                    "Dumping database {} to {}",
+                    args.db_path.display(),
+                    path.display()
+                );
+            }
+            perform_dump(path.as_deref(), &args.db_path)
         }
-        (backend, true) if backend != &sqld::Backend::Mwal => {
-            anyhow::bail!(
-                "--mwal-addr parameter conflicts with backend {:?}",
-                args.backend
-            )
+        None => {
+            args.print_welcome_message();
+            let config = config_from_args(args)?;
+            sqld::run_server(config).await?;
+
+            Ok(())
         }
-        _ => (),
     }
-
-    let config = config_from_args(args)?;
-    sqld::run_server(config).await?;
-
-    Ok(())
 }

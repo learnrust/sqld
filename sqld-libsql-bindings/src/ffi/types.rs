@@ -1,4 +1,4 @@
-///! Typedefs for virtual function signatures.
+//! Typedefs for virtual function signatures.
 use std::ffi::{c_char, c_int, c_uint, c_void};
 
 use super::{libsql_wal_methods, sqlite3_file, sqlite3_vfs, PgHdr, Wal};
@@ -15,8 +15,8 @@ pub type XWalDbsizeFn = extern "C" fn(wal: *mut Wal) -> u32;
 pub type XWalBeginWriteTransactionFn = extern "C" fn(wal: *mut Wal) -> c_int;
 pub type XWalEndWriteTransactionFn = extern "C" fn(wal: *mut Wal) -> c_int;
 pub type XWalSavepointFn = extern "C" fn(wal: *mut Wal, wal_data: *mut u32);
-pub type XWalSavePointUndoFn = extern "C" fn(wal: *mut Wal, wal_data: *mut u32) -> c_int;
-pub type XWalCheckpointFn = extern "C" fn(
+pub type XWalSavePointUndoFn = unsafe extern "C" fn(wal: *mut Wal, wal_data: *mut u32) -> c_int;
+pub type XWalCheckpointFn = unsafe extern "C" fn(
     wal: *mut Wal,
     db: *mut rusqlite::ffi::sqlite3,
     emode: c_int,

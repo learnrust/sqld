@@ -3,13 +3,15 @@
 pub mod types;
 
 pub use rusqlite::ffi::{
-    libsql_wal_methods, libsql_wal_methods_find, libsql_wal_methods_register, sqlite3,
-    sqlite3_file, sqlite3_io_methods, sqlite3_vfs, WalIndexHdr, SQLITE_CANTOPEN,
+    libsql_wal_methods, libsql_wal_methods_find, libsql_wal_methods_register,
+    libsql_wal_methods_unregister, sqlite3, sqlite3_file, sqlite3_hard_heap_limit64,
+    sqlite3_io_methods, sqlite3_soft_heap_limit64, sqlite3_vfs, WalIndexHdr, SQLITE_CANTOPEN,
     SQLITE_CHECKPOINT_FULL, SQLITE_CHECKPOINT_TRUNCATE, SQLITE_IOERR_WRITE, SQLITE_OK,
 };
 
 pub use rusqlite::ffi::libsql_pghdr as PgHdr;
 pub use rusqlite::ffi::libsql_wal as Wal;
+pub use rusqlite::ffi::*;
 
 pub struct PageHdrIter {
     current_ptr: *const PgHdr,

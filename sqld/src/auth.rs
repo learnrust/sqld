@@ -37,8 +37,20 @@ pub enum AuthError {
     Other,
 }
 
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Authorized {
+    FullAccess,
+    ReadOnly,
+}
+
 /// A witness that the user has been authenticated.
-pub struct Authenticated(());
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Authenticated {
+    Anonymous,
+    Authorized(Authorized),
+}
 
 impl Auth {
     pub fn authenticate_http(
@@ -46,7 +58,7 @@ impl Auth {
         auth_header: Option<&hyper::header::HeaderValue>,
     ) -> Result<Authenticated, AuthError> {
         if self.disabled {
-            return Ok(Authenticated(()));
+            return Ok(Authenticated::Authorized(Authorized::FullAccess));
         }
 
         let Some(auth_header) = auth_header else {
@@ -63,7 +75,7 @@ impl Auth {
                 let actual_value = actual_value.trim_end_matches('=');
                 let expected_value = expected_value.trim_end_matches('=');
                 if actual_value == expected_value {
-                    Ok(Authenticated(()))
+                    Ok(Authenticated::Authorized(Authorized::FullAccess))
                 } else {
                     Err(AuthError::BasicRejected)
                 }
@@ -74,7 +86,7 @@ impl Auth {
 
     pub fn authenticate_jwt(&self, jwt: Option<&str>) -> Result<Authenticated, AuthError> {
         if self.disabled {
-            return Ok(Authenticated(()));
+            return Ok(Authenticated::Authorized(Authorized::FullAccess));
         }
 
         let Some(jwt) = jwt else {
@@ -124,9 +136,21 @@ fn validate_jwt(
 ) -> Result<Authenticated, AuthError> {
     use jsonwebtoken::errors::ErrorKind;
 
-    let validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::EdDSA);
-    match jsonwebtoken::decode::<serde_json::Value>(jwt, jwt_key, &validation) {
-        Ok(_token) => Ok(Authenticated(())),
+    let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::EdDSA);
+    validation.required_spec_claims.remove("exp");
+
+    match jsonwebtoken::decode::<serde_json::Value>(jwt, jwt_key, &validation).map(|t| t.claims) {
+        Ok(serde_json::Value::Object(claims)) => {
+            tracing::trace!("Claims: {claims:#?}");
+            Ok(match claims.get("a").and_then(|s| s.as_str()) {
+                Some("ro") => Authenticated::Authorized(Authorized::ReadOnly),
+                Some("rw") => Authenticated::Authorized(Authorized::FullAccess),
+                Some(_) => Authenticated::Anonymous,
+                // Backward compatibility - no access claim means full access
+                None => Authenticated::Authorized(Authorized::FullAccess),
+            })
+        }
+        Ok(_) => Err(AuthError::JwtInvalid),
         Err(error) => Err(match error.kind() {
             ErrorKind::InvalidToken
             | ErrorKind::InvalidSignature
@@ -141,13 +165,17 @@ fn validate_jwt(
     }
 }
 
-pub fn parse_http_basic_auth_arg(arg: &str) -> Result<String> {
+pub fn parse_http_basic_auth_arg(arg: &str) -> Result<Option<String>> {
+    if arg == "always" {
+        return Ok(None);
+    }
+
     let Some((scheme, param)) = arg.split_once(':') else {
         bail!("invalid HTTP auth config: {arg}")
     };
 
     if scheme == "basic" {
-        Ok(param.into())
+        Ok(Some(param.into()))
     } else {
         bail!("unsupported HTTP auth scheme: {scheme:?}")
     }
@@ -167,6 +195,24 @@ pub fn parse_jwt_key(data: &str) -> Result<jsonwebtoken::DecodingKey> {
     }
 }
 
+impl AuthError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::HttpAuthHeaderMissing => "AUTH_HTTP_HEADER_MISSING",
+            Self::HttpAuthHeaderInvalid => "AUTH_HTTP_HEADER_INVALID",
+            Self::HttpAuthHeaderUnsupportedScheme => "AUTH_HTTP_HEADER_UNSUPPORTED_SCHEME",
+            Self::BasicNotAllowed => "AUTH_BASIC_NOT_ALLOWED",
+            Self::BasicRejected => "AUTH_BASIC_REJECTED",
+            Self::JwtMissing => "AUTH_JWT_MISSING",
+            Self::JwtNotAllowed => "AUTH_JWT_NOT_ALLOWED",
+            Self::JwtInvalid => "AUTH_JWT_INVALID",
+            Self::JwtExpired => "AUTH_JWT_EXPIRED",
+            Self::JwtImmature => "AUTH_JWT_IMMATURE",
+            Self::Other => "AUTH_FAILED",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,39 +222,60 @@ mod tests {
         auth.authenticate_http(Some(&HeaderValue::from_str(header).unwrap()))
     }
 
-    const VALID_JWT: &str = "eyJ0eXAiOiJKV1QiLCJhbGciOiJFZERTQSJ9.\
-        eyJleHAiOjE2NzczMzE3NTJ9.\
-        k1_9-JjMmGCtCuZb7HshOlRojPQmDgu_88o-t4SAR1r7YZCHr6TPaNtWH1tqZuNFut5P64fZTcE-RpiLd8IWDA";
-    const VALID_JWT_KEY: &str = "6Zx1NP27GNsej38CoGCQuUJZYAxGETQ1bIE-Fqxkyjk";
+    const VALID_JWT_KEY: &str = "zaMv-aFGmB7PXkjM4IrMdF6B5zCYEiEGXW3RgMjNAtc";
+    const VALID_JWT: &str = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.\
+        eyJleHAiOjc5ODg0ODM4Mjd9.\
+        MatB2aLnPFusagqH2RMoVExP37o2GFLmaJbmd52OdLtAehRNeqeJZPrefP1t2GBFidApUTLlaBRL6poKq_s3CQ";
+    const VALID_READONLY_JWT: &str = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.\
+        eyJleHAiOjc5ODg0ODM4MjcsImEiOiJybyJ9.\
+        _2ZZiO2HC8b3CbCHSCufXXBmwpl-dLCv5O9Owvpy7LZ9aiQhXODpgV-iCdTsLQJ5FVanWhfn3FtJSnmWHn25DQ";
+
+    macro_rules! assert_ok {
+        ($e:expr) => {
+            let res = $e;
+            if let Err(err) = res {
+                panic!("Expected Ok, got Err({:?})", err)
+            }
+        };
+    }
+
+    macro_rules! assert_err {
+        ($e:expr) => {
+            let res = $e;
+            if let Ok(ok) = res {
+                panic!("Expected Err, got Ok({:?})", ok);
+            }
+        };
+    }
 
     #[test]
     fn test_default() {
         let auth = Auth::default();
-        assert!(auth.authenticate_http(None).is_err());
-        assert!(authenticate_http(&auth, "Basic d29qdGVrOnRoZWJlYXI=").is_err());
-        assert!(auth.authenticate_jwt(Some(VALID_JWT)).is_err());
+        assert_err!(auth.authenticate_http(None));
+        assert_err!(authenticate_http(&auth, "Basic d29qdGVrOnRoZWJlYXI="));
+        assert_err!(auth.authenticate_jwt(Some(VALID_JWT)));
     }
 
     #[test]
     fn test_http_basic() {
         let auth = Auth {
-            http_basic: Some(parse_http_basic_auth_arg("basic:d29qdGVrOnRoZWJlYXI=").unwrap()),
+            http_basic: parse_http_basic_auth_arg("basic:d29qdGVrOnRoZWJlYXI=").unwrap(),
             ..Auth::default()
         };
-        assert!(authenticate_http(&auth, "Basic d29qdGVrOnRoZWJlYXI=").is_ok());
-        assert!(authenticate_http(&auth, "Basic d29qdGVrOnRoZWJlYXI").is_ok());
-        assert!(authenticate_http(&auth, "Basic d29qdGVrOnRoZWJlYXI===").is_ok());
+        assert_ok!(authenticate_http(&auth, "Basic d29qdGVrOnRoZWJlYXI="));
+        assert_ok!(authenticate_http(&auth, "Basic d29qdGVrOnRoZWJlYXI"));
+        assert_ok!(authenticate_http(&auth, "Basic d29qdGVrOnRoZWJlYXI==="));
 
-        assert!(authenticate_http(&auth, "basic d29qdGVrOnRoZWJlYXI=").is_ok());
+        assert_ok!(authenticate_http(&auth, "basic d29qdGVrOnRoZWJlYXI="));
 
-        assert!(authenticate_http(&auth, "Basic d29qdgvronrozwjlyxi=").is_err());
-        assert!(authenticate_http(&auth, "Basic d29qdGVrOnRoZWZveA==").is_err());
+        assert_err!(authenticate_http(&auth, "Basic d29qdgvronrozwjlyxi="));
+        assert_err!(authenticate_http(&auth, "Basic d29qdGVrOnRoZWZveA=="));
 
-        assert!(auth.authenticate_http(None).is_err());
-        assert!(authenticate_http(&auth, "").is_err());
-        assert!(authenticate_http(&auth, "foobar").is_err());
-        assert!(authenticate_http(&auth, "foo bar").is_err());
-        assert!(authenticate_http(&auth, "basic #$%^").is_err());
+        assert_err!(auth.authenticate_http(None));
+        assert_err!(authenticate_http(&auth, ""));
+        assert_err!(authenticate_http(&auth, "foobar"));
+        assert_err!(authenticate_http(&auth, "foo bar"));
+        assert_err!(authenticate_http(&auth, "basic #$%^"));
     }
 
     #[test]
@@ -217,11 +284,19 @@ mod tests {
             jwt_key: Some(parse_jwt_key(VALID_JWT_KEY).unwrap()),
             ..Auth::default()
         };
-        assert!(authenticate_http(&auth, &format!("Bearer {VALID_JWT}")).is_ok());
-        assert!(authenticate_http(&auth, &format!("bearer {VALID_JWT}")).is_ok());
+        assert_ok!(authenticate_http(&auth, &format!("Bearer {VALID_JWT}")));
+        assert_ok!(authenticate_http(&auth, &format!("bearer {VALID_JWT}")));
 
-        assert!(authenticate_http(&auth, "Bearer foobar").is_err());
-        assert!(authenticate_http(&auth, &format!("Bearer {}", &VALID_JWT[..80])).is_err());
+        assert_err!(authenticate_http(&auth, "Bearer foobar"));
+        assert_err!(authenticate_http(
+            &auth,
+            &format!("Bearer {}", &VALID_JWT[..80])
+        ));
+
+        assert_eq!(
+            authenticate_http(&auth, &format!("Bearer {VALID_READONLY_JWT}")).unwrap(),
+            Authenticated::Authorized(Authorized::ReadOnly)
+        );
     }
 
     #[test]
@@ -230,7 +305,7 @@ mod tests {
             jwt_key: Some(parse_jwt_key(VALID_JWT_KEY).unwrap()),
             ..Auth::default()
         };
-        assert!(auth.authenticate_jwt(Some(VALID_JWT)).is_ok());
-        assert!(auth.authenticate_jwt(Some(&VALID_JWT[..80])).is_err());
+        assert_ok!(auth.authenticate_jwt(Some(VALID_JWT)));
+        assert_err!(auth.authenticate_jwt(Some(&VALID_JWT[..80])));
     }
 }

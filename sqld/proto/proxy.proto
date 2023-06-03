@@ -13,6 +13,7 @@ message Query {
         Positional positional = 2;
         Named named = 3;
     }
+    bool skip_rows = 4;
 }
 
 message Positional {
@@ -47,6 +48,7 @@ message ResultRows {
     repeated Column   column_descriptions = 1;
     repeated Row      rows = 2;
     uint64            affected_row_count = 3;
+    optional int64    last_insert_rowid = 4;
 }
 
 message Value {
@@ -58,26 +60,16 @@ message Row {
     repeated Value values = 1;
 }
 
-enum Type {
-    Integer = 0;
-    Blob    = 1;
-    Real    = 2;
-    Text    = 3;
-    Null    = 4;
-    Unknown = 5;
-    Numeric = 6;
-}
-
 message Column {
     string          name = 1;
-    optional Type   ty = 2;
+    optional string decltype = 3;
 }
 
 message DisconnectMessage {
-    bytes clientId = 1;
+    string clientId = 1;
 }
 
-message Ack {}
+message Ack { }
 
 message ExecuteResults {
     repeated QueryResult results = 1;
@@ -88,9 +80,61 @@ message ExecuteResults {
     }
     /// State after executing the queries
     State state = 2;
+    /// Primary frame_no after executing the request.
+    uint64 current_frame_no = 3;
+}
+
+message Program {
+    repeated Step steps = 1;
+}
+
+message Step {
+    optional Cond cond = 1;
+    Query query = 2;
+}
+
+message Cond {
+    oneof cond {
+        OkCond ok = 1;
+        ErrCond err = 2;
+        NotCond not = 3;
+        AndCond and = 4;
+        OrCond or = 5;
+    }
+}
+
+message OkCond {
+    int64 step = 1;
+}
+
+message ErrCond {
+    int64 step = 1;
+}
+
+message NotCond {
+    Cond cond = 1;
+}
+
+message AndCond {
+    repeated Cond conds = 1;
+}
+
+message OrCond {
+    repeated Cond conds = 1;
+}
+
+enum Authorized {
+    READONLY = 0;
+    FULL = 1;
+}
+
+message ProgramReq {
+    string client_id = 1;
+    Program pgm = 2;
+    optional Authorized authorized = 3;
 }
 
 service Proxy {
-  rpc Execute(Queries) returns (ExecuteResults) {}
+  rpc Execute(ProgramReq) returns (ExecuteResults) {}
   rpc Disconnect(DisconnectMessage) returns (Ack) {}
 }

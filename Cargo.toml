@@ -9,5 +9,10 @@ members = [
     "testing/end-to-end",
 ]
 
-[patch.crates-io]
-uuid = { git = "https://github.com/psarna/uuid", branch = "stable_v7" }
+[workspace.dependencies]
+rusqlite = { version = "0.29.0", git = "https://github.com/psarna/rusqlite", rev = "d9a97c0f25", default-features = false, features = [
+    "buildtime_bindgen",
+    "bundled-libsql-wasm-experimental",
+    "column_decltype",
+    "load_extension"
+] }

@@ -1,17 +1,16 @@
 use anyhow::Result;
 use fallible_iterator::FallibleIterator;
-use sqlite3_parser::{
-    ast::{Cmd, Stmt},
-    lexer::sql::{Parser, ParserError},
-};
+use sqlite3_parser::ast::{Cmd, PragmaBody, QualifiedName, Stmt};
+use sqlite3_parser::lexer::sql::{Parser, ParserError};
 
 /// A group of statements to be executed together.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Statement {
     pub stmt: String,
     pub kind: StmtKind,
     /// Is the statement an INSERT, UPDATE or DELETE?
     pub is_iud: bool,
+    pub is_insert: bool,
 }
 
 impl Default for Statement {
@@ -32,6 +31,19 @@ pub enum StmtKind {
     Other,
 }
 
+fn is_temp(name: &QualifiedName) -> bool {
+    name.db_name.as_ref().map(|n| n.0.as_str()) == Some("TEMP")
+}
+
+fn is_reserved_tbl(name: &QualifiedName) -> bool {
+    let n = name.name.0.to_lowercase();
+    n == "_litestream_seq" || n == "_litestream_lock" || n == "libsql_wasm_func_table"
+}
+
+fn write_if_not_reserved(name: &QualifiedName) -> Option<StmtKind> {
+    (!is_reserved_tbl(name)).then_some(StmtKind::Write)
+}
+
 impl StmtKind {
     fn kind(cmd: &Cmd) -> Option<Self> {
         match cmd {
@@ -40,16 +52,112 @@ impl StmtKind {
             Cmd::Stmt(Stmt::Begin { .. }) => Some(Self::TxnBegin),
             Cmd::Stmt(Stmt::Commit { .. } | Stmt::Rollback { .. }) => Some(Self::TxnEnd),
             Cmd::Stmt(
-                Stmt::Insert { .. }
-                | Stmt::CreateTable { .. }
-                | Stmt::Update { .. }
-                | Stmt::Delete { .. }
-                | Stmt::DropTable { .. }
-                | Stmt::AlterTable { .. }
+                Stmt::CreateVirtualTable { tbl_name, .. }
+                | Stmt::CreateTable {
+                    tbl_name,
+                    temporary: false,
+                    ..
+                },
+            ) if !is_temp(tbl_name) => Some(Self::Write),
+            Cmd::Stmt(
+                Stmt::Insert {
+                    with: _,
+                    or_conflict: _,
+                    tbl_name,
+                    ..
+                }
+                | Stmt::Update {
+                    with: _,
+                    or_conflict: _,
+                    tbl_name,
+                    ..
+                },
+            ) => write_if_not_reserved(tbl_name),
+
+            Cmd::Stmt(Stmt::Delete {
+                with: _, tbl_name, ..
+            }) => write_if_not_reserved(tbl_name),
+            Cmd::Stmt(Stmt::DropTable {
+                if_exists: _,
+                tbl_name,
+            }) => write_if_not_reserved(tbl_name),
+            Cmd::Stmt(Stmt::AlterTable(tbl_name, _)) => write_if_not_reserved(tbl_name),
+            Cmd::Stmt(
+                Stmt::DropIndex { .. }
+                | Stmt::CreateTrigger {
+                    temporary: false, ..
+                }
                 | Stmt::CreateIndex { .. },
             ) => Some(Self::Write),
             Cmd::Stmt(Stmt::Select { .. }) => Some(Self::Read),
+            Cmd::Stmt(Stmt::Pragma(name, body)) => Self::pragma_kind(name, body.as_ref()),
             _ => None,
+        }
+    }
+
+    fn pragma_kind(name: &QualifiedName, body: Option<&PragmaBody>) -> Option<Self> {
+        let name = name.name.0.as_str();
+        match name {
+            // always ok to be served by primary or replicas - pure readonly pragmas
+            "table_list" | "index_list" | "table_info" | "table_xinfo" | "index_xinfo"
+            | "pragma_list" | "compile_options" | "database_list" | "function_list"
+            | "module_list" => Some(Self::Read),
+            // special case for `encoding` - it's effectively readonly for connections
+            // that already created a database, which is always the case for sqld
+            "encoding" => Some(Self::Read),
+            // always ok to be served by primary
+            "foreign_keys" | "foreign_key_list" | "foreign_key_check" | "collation_list"
+            | "data_version" | "freelist_count" | "integrity_check" | "legacy_file_format"
+            | "page_count" | "quick_check" | "stats" => Some(Self::Write),
+            // ok to be served by primary without args
+            "analysis_limit"
+            | "application_id"
+            | "auto_vacuum"
+            | "automatic_index"
+            | "busy_timeout"
+            | "cache_size"
+            | "cache_spill"
+            | "cell_size_check"
+            | "checkpoint_fullfsync"
+            | "defer_foreign_keys"
+            | "fullfsync"
+            | "hard_heap_limit"
+            | "journal_mode"
+            | "journal_size_limit"
+            | "legacy_alter_table"
+            | "locking_mode"
+            | "max_page_count"
+            | "mmap_size"
+            | "page_size"
+            | "query_only"
+            | "read_uncommitted"
+            | "recursive_triggers"
+            | "reverse_unordered_selects"
+            | "schema_version"
+            | "secure_delete"
+            | "soft_heap_limit"
+            | "synchronous"
+            | "temp_store"
+            | "threads"
+            | "trusted_schema"
+            | "user_version"
+            | "wal_autocheckpoint" => {
+                match body {
+                    Some(_) => None,
+                    None => Some(Self::Write),
+                }
+            }
+            // changes the state of the connection, and can't be allowed rn:
+            "case_sensitive_like" | "ignore_check_constraints" | "incremental_vacuum"
+                // TODO: check if optimize can be safely performed
+                | "optimize"
+                | "parser_trace"
+                | "shrink_memory"
+                | "wal_checkpoint" => None,
+            _ => {
+                tracing::debug!("Unknown pragma: {name}");
+                None
+            },
         }
     }
 }
@@ -88,33 +196,43 @@ impl Statement {
             // empty statement is arbitrarely made of the read kind so it is not send to a writer
             kind: StmtKind::Read,
             is_iud: false,
-        }
-    }
-
-    /// Returns a statement instance without performing any validation to the input
-    /// It is always assumed that such a statement will be a write, and will always be handled by
-    /// the primary
-    pub fn new_unchecked(s: &str) -> Self {
-        Self {
-            stmt: s.to_string(),
-            kind: StmtKind::Write,
-            is_iud: false,
+            is_insert: false,
         }
     }
 
     pub fn parse(s: &str) -> impl Iterator<Item = Result<Self>> + '_ {
-        fn parse_inner(c: Cmd) -> Result<Statement> {
+        fn parse_inner(
+            original: &str,
+            stmt_count: u64,
+            has_more_stmts: bool,
+            c: Cmd,
+        ) -> Result<Statement> {
             let kind =
                 StmtKind::kind(&c).ok_or_else(|| anyhow::anyhow!("unsupported statement"))?;
+
+            if stmt_count == 1 && !has_more_stmts {
+                // XXX: Temporary workaround for integration with Atlas
+                if let Cmd::Stmt(Stmt::CreateTable { .. }) = &c {
+                    return Ok(Statement {
+                        stmt: original.to_string(),
+                        kind,
+                        is_iud: false,
+                        is_insert: false,
+                    });
+                }
+            }
+
             let is_iud = matches!(
                 c,
                 Cmd::Stmt(Stmt::Insert { .. } | Stmt::Update { .. } | Stmt::Delete { .. })
             );
+            let is_insert = matches!(c, Cmd::Stmt(Stmt::Insert { .. }));
 
             Ok(Statement {
                 stmt: c.to_string(),
                 kind,
                 is_iud,
+                is_insert,
             })
         }
         // The parser needs to be boxed because it's large, and you don't want it on the stack.
@@ -122,20 +240,29 @@ impl Statement {
         // on the heap:
         // - https://github.com/gwenn/lemon-rs/issues/8
         // - https://github.com/gwenn/lemon-rs/pull/19
-        let mut parser = Box::new(Parser::new(s.as_bytes()));
-        std::iter::from_fn(move || match parser.next() {
-            Ok(Some(cmd)) => Some(parse_inner(cmd)),
-            Ok(None) => None,
-            Err(sqlite3_parser::lexer::sql::Error::ParserError(
-                ParserError::SyntaxError {
-                    token_type: _,
-                    found: Some(found),
-                },
-                Some((line, col)),
-            )) => Some(Err(anyhow::anyhow!(
-                "syntax error around L{line}:{col}: `{found}`"
-            ))),
-            Err(e) => Some(Err(e.into())),
+        let mut parser = Box::new(Parser::new(s.as_bytes()).peekable());
+        let mut stmt_count = 0;
+        std::iter::from_fn(move || {
+            stmt_count += 1;
+            match parser.next() {
+                Ok(Some(cmd)) => Some(parse_inner(
+                    s,
+                    stmt_count,
+                    parser.peek().map_or(true, |o| o.is_some()),
+                    cmd,
+                )),
+                Ok(None) => None,
+                Err(sqlite3_parser::lexer::sql::Error::ParserError(
+                    ParserError::SyntaxError {
+                        token_type: _,
+                        found: Some(found),
+                    },
+                    Some((line, col)),
+                )) => Some(Err(anyhow::anyhow!(
+                    "syntax error around L{line}:{col}: `{found}`"
+                ))),
+                Err(e) => Some(Err(e.into())),
+            }
         })
     }
 
@@ -147,9 +274,12 @@ impl Statement {
     }
 }
 
-/// Given a an initial state and an array of queries, return the final state obtained if all the
-/// queries succeeded
-pub fn final_state<'a>(mut state: State, stmts: impl Iterator<Item = &'a Statement>) -> State {
+/// Given a an initial state and an array of queries, attempts to predict what the final state will
+/// be
+pub fn predict_final_state<'a>(
+    mut state: State,
+    stmts: impl Iterator<Item = &'a Statement>,
+) -> State {
     for stmt in stmts {
         state.step(stmt.kind);
     }
