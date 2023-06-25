@@ -6,9 +6,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{bail, Context as _, Result};
+use bytesize::ByteSize;
 use clap::Parser;
 use mimalloc::MiMalloc;
-use sqld::{database::dump::exporter::export_dump, Config};
+use sqld::{database::dump::exporter::export_dump, version::Version, Config};
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::prelude::__tracing_subscriber_SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -20,7 +21,7 @@ static GLOBAL: MiMalloc = MiMalloc;
 /// SQL daemon
 #[derive(Debug, Parser)]
 #[command(name = "sqld")]
-#[command(about = "SQL daemon", version, long_about = None)]
+#[command(about = "SQL daemon", version = Version::default(), long_about = None)]
 struct Cli {
     #[clap(long, short, default_value = "data.sqld", env = "SQLD_DB_PATH")]
     db_path: PathBuf,
@@ -39,9 +40,13 @@ struct Cli {
     #[clap(long)]
     enable_http_console: bool,
 
-    /// The address and port the Hrana server listens to.
+    /// Address and port for the legacy, Web-Socket-only Hrana server.
     #[clap(long, short = 'l', env = "SQLD_HRANA_LISTEN_ADDR")]
     hrana_listen_addr: Option<SocketAddr>,
+
+    /// The address and port for the admin HTTP API.
+    #[clap(long, env = "SQLD_ADMIN_LISTEN_ADDR")]
+    admin_listen_addr: Option<SocketAddr>,
 
     /// Path to a file with a JWT decoding key used to authenticate clients in the Hrana and HTTP
     /// APIs. The key is either a PKCS#8-encoded Ed25519 public key in PEM, or just plain bytes of
@@ -155,6 +160,15 @@ struct Cli {
     /// if it goes over this limit with memory usage.
     #[clap(long, env = "SQLD_HARD_HEAP_LIMIT_MB")]
     hard_heap_limit_mb: Option<usize>,
+
+    /// Allow the replica to overwrite its data if the primary starts replicating a different
+    /// database. This is often the case when the primary goes through a recovery process.
+    #[clap(long, env = "SQLD_ALLOW_REPLICA_OVERWRITE")]
+    allow_replica_overwrite: bool,
+
+    /// Set the maximum size for a response. e.g 5KB, 10MB...
+    #[clap(long, env = "SQLD_MAX_RESPONSE_SIZE", default_value = "10MB")]
+    max_response_size: ByteSize,
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -229,6 +243,7 @@ fn config_from_args(args: Cli) -> Result<Config> {
         http_addr: Some(args.http_listen_addr),
         enable_http_console: args.enable_http_console,
         hrana_addr: args.hrana_listen_addr,
+        admin_addr: args.admin_listen_addr,
         auth_jwt_key,
         http_auth: args.http_auth,
         http_self_url: args.http_self_url,
@@ -244,7 +259,19 @@ fn config_from_args(args: Cli) -> Result<Config> {
         rpc_server_key: args.grpc_key_file,
         rpc_server_ca_cert: args.grpc_ca_cert_file,
         #[cfg(feature = "bottomless")]
-        enable_bottomless_replication: args.enable_bottomless_replication,
+        bottomless_replication: if args.enable_bottomless_replication {
+            Some(bottomless::replicator::Options {
+                create_bucket_if_not_exists: true,
+                verify_crc: false,
+                use_compression: true,
+                aws_endpoint: env::var("LIBSQL_BOTTOMLESS_ENDPOINT").ok(),
+                bucket_name: env::var("LIBSQL_BOTTOMLESS_BUCKET")
+                    .unwrap_or_else(|_| "bottomless".to_string()),
+                ..bottomless::replicator::Options::default()
+            })
+        } else {
+            None
+        },
         idle_shutdown_timeout: args.idle_shutdown_timeout_s.map(Duration::from_secs),
         load_from_dump: args.load_from_dump,
         max_log_size: args.max_log_size,
@@ -253,6 +280,8 @@ fn config_from_args(args: Cli) -> Result<Config> {
         heartbeat_period: Duration::from_secs(args.heartbeat_period_s),
         soft_heap_limit_mb: args.soft_heap_limit_mb,
         hard_heap_limit_mb: args.hard_heap_limit_mb,
+        allow_replica_overwrite: args.allow_replica_overwrite,
+        max_response_size: args.max_response_size.0,
     })
 }
 

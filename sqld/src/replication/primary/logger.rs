@@ -79,7 +79,7 @@ unsafe impl WalHook for ReplicationLoggerHook {
         #[cfg(feature = "bottomless")]
         let last_valid_frame = wal.hdr.mxFrame;
         #[cfg(feature = "bottomless")]
-        let frame_checksum = wal.hdr.aFrameCksum;
+        let _frame_checksum = wal.hdr.aFrameCksum;
         let ctx = Self::wal_extract_ctx(wal);
 
         for (page_no, data) in PageHdrIter::new(page_headers, page_size as _) {
@@ -90,39 +90,6 @@ unsafe impl WalHook for ReplicationLoggerHook {
             // returning IO_ERR ensure that xUndo will be called by sqlite.
             return SQLITE_IOERR;
         }
-
-        // FIXME: instead of block_on, we should consider replicating asynchronously in the background,
-        // e.g. by sending the data to another fiber by an unbounded channel (which allows sync insertions).
-        #[allow(clippy::await_holding_lock)] // uncontended -> only gets called under a libSQL write lock
-        #[cfg(feature = "bottomless")]
-        let last_consistent_frame = {
-            let runtime = tokio::runtime::Handle::current();
-            if let Some(replicator) = ctx.bottomless_replicator.as_mut() {
-                match runtime.block_on(async move {
-                    let mut replicator = replicator.lock().unwrap();
-                    replicator.register_last_valid_frame(last_valid_frame);
-                    // In theory it's enough to set the page size only once, but in practice
-                    // it's a very cheap operation anyway, and the page is not always known
-                    // upfront and can change dynamically.
-                    // FIXME: changing the page size in the middle of operation is *not*
-                    // supported by bottomless storage.
-                    replicator.set_page_size(page_size as usize)?;
-                    for (pgno, data) in PageHdrIter::new(page_headers, page_size as usize) {
-                        replicator.write(pgno, data);
-                    }
-
-                    replicator.flush().await
-                }) {
-                    Ok(last_consistent_frame) => last_consistent_frame,
-                    Err(e) => {
-                        tracing::error!("error writing to bottomless: {e}");
-                        return SQLITE_IOERR_WRITE;
-                    }
-                }
-            } else {
-                0
-            }
-        };
 
         let rc = unsafe {
             orig(
@@ -135,24 +102,36 @@ unsafe impl WalHook for ReplicationLoggerHook {
             )
         };
 
-        if is_commit != 0 && rc == 0 {
-            #[allow(clippy::await_holding_lock)] // uncontended -> only gets called under a libSQL write lock
-            #[cfg(feature = "bottomless")]
-            {
-                let runtime = tokio::runtime::Handle::current();
-                if let Some(replicator) = ctx.bottomless_replicator.as_mut() {
-                    if let Err(e) = runtime.block_on(async move {
-                        let mut replicator = replicator.lock().unwrap();
-                        replicator
-                            .finalize_commit(last_consistent_frame, frame_checksum)
-                            .await
-                    }) {
+        // FIXME: instead of block_on, we should consider replicating asynchronously in the background,
+        // e.g. by sending the data to another fiber by an unbounded channel (which allows sync insertions).
+        #[allow(clippy::await_holding_lock)] // uncontended -> only gets called under a libSQL write lock
+        #[cfg(feature = "bottomless")]
+        if rc == 0 {
+            let runtime = tokio::runtime::Handle::current();
+            if let Some(replicator) = ctx.bottomless_replicator.as_mut() {
+                match runtime.block_on(async move {
+                    let mut replicator = replicator.lock().unwrap();
+                    replicator.register_last_valid_frame(last_valid_frame);
+                    // In theory it's enough to set the page size only once, but in practice
+                    // it's a very cheap operation anyway, and the page is not always known
+                    // upfront and can change dynamically.
+                    // FIXME: changing the page size in the middle of operation is *not*
+                    // supported by bottomless storage.
+                    replicator.set_page_size(page_size as usize)?;
+                    let frame_count = PageHdrIter::new(page_headers, page_size as usize).count();
+                    replicator.submit_frames(frame_count as u32);
+                    Ok::<(), anyhow::Error>(())
+                }) {
+                    Ok(()) => {}
+                    Err(e) => {
                         tracing::error!("error writing to bottomless: {e}");
                         return SQLITE_IOERR_WRITE;
                     }
                 }
             }
+        }
 
+        if is_commit != 0 && rc == 0 {
             if let Err(e) = ctx.commit() {
                 // If we reach this point, it means that we have commited a transaction to sqlite wal,
                 // but failed to commit it to the shadow WAL, which leaves us in an inconsistent state.
@@ -272,9 +251,20 @@ unsafe impl WalHook for ReplicationLoggerHook {
             let runtime = tokio::runtime::Handle::current();
             if let Some(replicator) = ctx.bottomless_replicator.as_mut() {
                 let mut replicator = replicator.lock().unwrap();
-                if replicator.commits_in_current_generation == 0 {
+                if replicator.commits_in_current_generation() == 0 {
                     tracing::debug!("No commits happened in this generation, not snapshotting");
                     return SQLITE_OK;
+                }
+                let last_known_frame = replicator.next_frame_no() - 1;
+                replicator.request_flush();
+                if let Err(e) = runtime.block_on(replicator.wait_until_committed(last_known_frame))
+                {
+                    tracing::error!(
+                        "Failed to wait for S3 replicator to confirm {} frames backup: {}",
+                        last_known_frame,
+                        e
+                    );
+                    return SQLITE_IOERR_WRITE;
                 }
                 replicator.new_generation();
                 if let Err(e) =
@@ -741,7 +731,7 @@ pub struct ReplicationLogger {
 }
 
 impl ReplicationLogger {
-    pub fn open(db_path: &Path, max_log_size: u64) -> anyhow::Result<Self> {
+    pub fn open(db_path: &Path, max_log_size: u64, dirty: bool) -> anyhow::Result<Self> {
         let log_path = db_path.join("wallog");
         let data_path = db_path.join("data");
 
@@ -757,7 +747,10 @@ impl ReplicationLogger {
         let log_file = LogFile::new(file, max_log_frame_count)?;
         let header = log_file.header();
 
-        let should_recover = if header.version < 2 || header.sqld_version() != Version::current() {
+        let should_recover = if dirty {
+            tracing::info!("Replication log is dirty, recovering from database file.");
+            true
+        } else if header.version < 2 || header.sqld_version() != Version::current() {
             tracing::info!("replication log version not compatible with current sqld version, recovering from database file.");
             true
         } else if fresh && data_path.exists() {
@@ -912,7 +905,7 @@ mod test {
     #[test]
     fn write_and_read_from_frame_log() {
         let dir = tempfile::tempdir().unwrap();
-        let logger = ReplicationLogger::open(dir.path(), 0).unwrap();
+        let logger = ReplicationLogger::open(dir.path(), 0, false).unwrap();
 
         let frames = (0..10)
             .map(|i| WalPage {
@@ -940,7 +933,7 @@ mod test {
     #[test]
     fn index_out_of_bounds() {
         let dir = tempfile::tempdir().unwrap();
-        let logger = ReplicationLogger::open(dir.path(), 0).unwrap();
+        let logger = ReplicationLogger::open(dir.path(), 0, false).unwrap();
         let log_file = logger.log_file.write();
         assert!(matches!(log_file.frame(1), Err(LogReadError::Ahead)));
     }
@@ -949,7 +942,7 @@ mod test {
     #[should_panic]
     fn incorrect_frame_size() {
         let dir = tempfile::tempdir().unwrap();
-        let logger = ReplicationLogger::open(dir.path(), 0).unwrap();
+        let logger = ReplicationLogger::open(dir.path(), 0, false).unwrap();
         let entry = WalPage {
             page_no: 0,
             size_after: 0,
