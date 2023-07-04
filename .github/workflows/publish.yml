@@ -60,7 +60,13 @@ jobs:
           git config --global core.eol lf
 
       - uses: actions/checkout@v3
-
+        if: ${{ github.event.inputs.tag }} == "v0.0.0"
+        with:
+          ref: ${{ github.event.inputs.tag }}
+      
+      - uses: actions/checkout@v3
+        if: ${{ github.event.inputs.tag }} != "v0.0.0"
+          
       - name: Get Rust toolchain version from rust-toolchain.toml
         id: getrustver
         run: |
@@ -165,10 +171,10 @@ jobs:
       - name: install dependencies (macos)
         if: startsWith(matrix.os, 'macos')
         run: |
-          brew install llvm
-          brew install pkg-config
-          brew install protobuf
-
+          brew install llvm || /opt/homebrew/bin/brew install llvm
+          brew install pkg-config || /opt/homebrew/bin/brew install pkg-config
+          brew install protobuf || /opt/homebrew/bin/brew install protobuf
+          
       - name: Build sqld (linux/macos)
         if: matrix.os != 'windows-latest'
         run: |

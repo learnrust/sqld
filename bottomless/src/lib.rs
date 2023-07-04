@@ -7,12 +7,12 @@ mod ffi;
 mod backup;
 mod read;
 pub mod replicator;
+mod transaction_cache;
 mod wal;
 
 use crate::ffi::{
     bottomless_methods, libsql_wal_methods, sqlite3, sqlite3_file, sqlite3_vfs, PgHdr, Wal,
 };
-use crate::replicator::{CompressionKind, Options};
 use std::ffi::{c_char, c_void};
 
 // Just heuristics, but should work for ~100% of cases
@@ -407,7 +407,7 @@ pub extern "C" fn xGetPathname(buf: *mut c_char, orig: *const c_char, orig_len: 
 }
 
 async fn try_restore(replicator: &mut replicator::Replicator) -> i32 {
-    match replicator.restore().await {
+    match replicator.restore(None, None).await {
         Ok(replicator::RestoreAction::None) => (),
         Ok(replicator::RestoreAction::SnapshotMainDbFile) => {
             replicator.new_generation();
@@ -465,18 +465,14 @@ pub extern "C" fn xPreMainDbOpen(_methods: *mut libsql_wal_methods, path: *const
         }
     };
 
-    let replicator = block_on!(
-        runtime,
-        replicator::Replicator::with_options(
-            path,
-            replicator::Options {
-                create_bucket_if_not_exists: true,
-                verify_crc: true,
-                use_compression: CompressionKind::Gzip,
-                ..Options::default()
-            }
-        )
-    );
+    let options = match replicator::Options::from_env() {
+        Ok(options) => options,
+        Err(e) => {
+            tracing::error!("Failed to parse replicator options: {}", e);
+            return ffi::SQLITE_CANTOPEN;
+        }
+    };
+    let replicator = block_on!(runtime, replicator::Replicator::with_options(path, options));
     let mut replicator = match replicator {
         Ok(repl) => repl,
         Err(e) => {
