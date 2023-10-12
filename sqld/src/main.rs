@@ -1,19 +1,28 @@
 use std::env;
-use std::fs::{self, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::{stdout, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::Arc;
 
 use anyhow::{bail, Context as _, Result};
 use bytesize::ByteSize;
 use clap::Parser;
+use hyper::client::HttpConnector;
 use mimalloc::MiMalloc;
-use sqld::{database::dump::exporter::export_dump, version::Version, Config};
-use tracing_subscriber::filter::LevelFilter;
-use tracing_subscriber::prelude::__tracing_subscriber_SubscriberExt;
+use tokio::sync::Notify;
+use tokio::time::Duration;
+use tracing_subscriber::prelude::*;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::Layer;
+
+use sqld::config::{
+    AdminApiConfig, DbConfig, HeartbeatConfig, RpcClientConfig, RpcServerConfig, TlsConfig,
+    UserApiConfig,
+};
+use sqld::net::AddrIncoming;
+use sqld::Server;
+use sqld::{connection::dump::exporter::export_dump, version::Version};
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -28,8 +37,7 @@ struct Cli {
 
     /// The directory path where trusted extensions can be loaded from.
     /// If not present, extension loading is disabled.
-    /// If present, the directory is expected to have a trusted.lst file containing
-    /// the sha256 and name of each extension, one per line. Example:
+    /// If present, the directory is expected to have a trusted.lst file containing the sha256 and name of each extension, one per line. Example:
     ///
     /// 99890762817735984843bf5cf02a4b2ea648018fd05f04df6f9ce7f976841510  math.dylib
     #[clap(long, short)]
@@ -102,19 +110,9 @@ struct Cli {
     #[clap(long)]
     primary_grpc_ca_cert_file: Option<PathBuf>,
 
-    #[clap(
-        long,
-        short,
-        value_enum,
-        default_value = "libsql",
-        env = "SQLD_BACKEND"
-    )]
-    backend: sqld::Backend,
-
     /// Don't display welcome message
     #[clap(long)]
     no_welcome: bool,
-    #[cfg(feature = "bottomless")]
     #[clap(long, env = "SQLD_ENABLE_BOTTOMLESS_REPLICATION")]
     enable_bottomless_replication: bool,
     /// The duration, in second, after which to shutdown the server if no request have been
@@ -123,15 +121,21 @@ struct Cli {
     #[clap(long, env = "SQLD_IDLE_SHUTDOWN_TIMEOUT_S")]
     idle_shutdown_timeout_s: Option<u64>,
 
-    /// Load the dump at the provided path.
-    /// Requires that the node is not in replica mode
-    #[clap(long, env = "SQLD_LOAD_DUMP_PATH", conflicts_with = "primary_grpc_url")]
-    load_from_dump: Option<PathBuf>,
+    /// Like idle_shutdown_timeout_s but used only once after the server is started.
+    /// After that server either is shut down because it does not receive any requests
+    /// or idle_shutdown_timeout_s is used moving forward.
+    #[clap(long, env = "SQLD_INITIAL_IDLE_SHUTDOWN_TIMEOUT_S")]
+    initial_idle_shutdown_timeout_s: Option<u64>,
 
     /// Maximum size the replication log is allowed to grow (in MB).
     /// defaults to 200MB.
     #[clap(long, env = "SQLD_MAX_LOG_SIZE", default_value = "200")]
     max_log_size: u64,
+    /// Maximum duration before the replication log is compacted (in seconds).
+    /// By default, the log is compacted only if it grows above the limit specified with
+    /// `--max-log-size`.
+    #[clap(long, env = "SQLD_MAX_LOG_DURATION")]
+    max_log_duration: Option<f32>,
 
     #[clap(subcommand)]
     utils: Option<UtilsSubcommands>,
@@ -161,14 +165,32 @@ struct Cli {
     #[clap(long, env = "SQLD_HARD_HEAP_LIMIT_MB")]
     hard_heap_limit_mb: Option<usize>,
 
-    /// Allow the replica to overwrite its data if the primary starts replicating a different
-    /// database. This is often the case when the primary goes through a recovery process.
-    #[clap(long, env = "SQLD_ALLOW_REPLICA_OVERWRITE")]
-    allow_replica_overwrite: bool,
-
     /// Set the maximum size for a response. e.g 5KB, 10MB...
     #[clap(long, env = "SQLD_MAX_RESPONSE_SIZE", default_value = "10MB")]
     max_response_size: ByteSize,
+
+    /// Set the maximum size for all responses. e.g 5KB, 10MB...
+    #[clap(long, env = "SQLD_MAX_TOTAL_RESPONSE_SIZE", default_value = "32MB")]
+    max_total_response_size: ByteSize,
+
+    /// Set a command to execute when a snapshot file is generated.
+    #[clap(long, env = "SQLD_SNAPSHOT_EXEC")]
+    snapshot_exec: Option<String>,
+
+    /// Interval in seconds, in which WAL checkpoint is being called.
+    /// By default, the interval is 1 hour.
+    #[clap(long, env = "SQLD_CHECKPOINT_INTERVAL_S")]
+    checkpoint_interval_s: Option<u64>,
+
+    /// By default, all request for which a namespace can't be determined fallaback to the default
+    /// namespace `default`. This flag disables that.
+    #[clap(long)]
+    disable_default_namespace: bool,
+
+    /// Enable the namespaces features. Namespaces are disabled by default, and all requests target
+    /// the default namespace.
+    #[clap(long)]
+    enable_namespaces: bool,
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -177,6 +199,8 @@ enum UtilsSubcommands {
         #[clap(long)]
         /// Path at which to write the dump
         path: Option<PathBuf>,
+        #[clap(long)]
+        namespace: String,
     },
 }
 
@@ -223,60 +247,6 @@ impl Cli {
     }
 }
 
-fn config_from_args(args: Cli) -> Result<Config> {
-    let auth_jwt_key = if let Some(file_path) = args.auth_jwt_key_file {
-        let data = fs::read_to_string(file_path).context("Could not read file with JWT key")?;
-        Some(data)
-    } else {
-        match env::var("SQLD_AUTH_JWT_KEY") {
-            Ok(key) => Some(key),
-            Err(env::VarError::NotPresent) => None,
-            Err(env::VarError::NotUnicode(_)) => {
-                bail!("Env variable SQLD_AUTH_JWT_KEY does not contain a valid Unicode value")
-            }
-        }
-    };
-
-    Ok(Config {
-        db_path: args.db_path,
-        extensions_path: args.extensions_path,
-        http_addr: Some(args.http_listen_addr),
-        enable_http_console: args.enable_http_console,
-        hrana_addr: args.hrana_listen_addr,
-        admin_addr: args.admin_listen_addr,
-        auth_jwt_key,
-        http_auth: args.http_auth,
-        http_self_url: args.http_self_url,
-        backend: args.backend,
-        writer_rpc_addr: args.primary_grpc_url,
-        writer_rpc_tls: args.primary_grpc_tls,
-        writer_rpc_cert: args.primary_grpc_cert_file,
-        writer_rpc_key: args.primary_grpc_key_file,
-        writer_rpc_ca_cert: args.primary_grpc_ca_cert_file,
-        rpc_server_addr: args.grpc_listen_addr,
-        rpc_server_tls: args.grpc_tls,
-        rpc_server_cert: args.grpc_cert_file,
-        rpc_server_key: args.grpc_key_file,
-        rpc_server_ca_cert: args.grpc_ca_cert_file,
-        #[cfg(feature = "bottomless")]
-        bottomless_replication: if args.enable_bottomless_replication {
-            Some(bottomless::replicator::Options::from_env()?)
-        } else {
-            None
-        },
-        idle_shutdown_timeout: args.idle_shutdown_timeout_s.map(Duration::from_secs),
-        load_from_dump: args.load_from_dump,
-        max_log_size: args.max_log_size,
-        heartbeat_url: args.heartbeat_url,
-        heartbeat_auth: args.heartbeat_auth,
-        heartbeat_period: Duration::from_secs(args.heartbeat_period_s),
-        soft_heap_limit_mb: args.soft_heap_limit_mb,
-        hard_heap_limit_mb: args.hard_heap_limit_mb,
-        allow_replica_overwrite: args.allow_replica_overwrite,
-        max_response_size: args.max_response_size.0,
-    })
-}
-
 fn perform_dump(dump_path: Option<&Path>, db_path: &Path) -> anyhow::Result<()> {
     let out: Box<dyn Write> = match dump_path {
         Some(path) => {
@@ -311,8 +281,217 @@ fn enable_libsql_logging() {
     });
 }
 
+fn make_db_config(config: &Cli) -> anyhow::Result<DbConfig> {
+    Ok(DbConfig {
+        extensions_path: config.extensions_path.clone().map(Into::into),
+        bottomless_replication: config
+            .enable_bottomless_replication
+            .then(bottomless::replicator::Options::from_env)
+            .transpose()?,
+        max_log_size: config.max_log_size,
+        max_log_duration: config.max_log_duration,
+        soft_heap_limit_mb: config.soft_heap_limit_mb,
+        hard_heap_limit_mb: config.hard_heap_limit_mb,
+        max_response_size: config.max_response_size.as_u64(),
+        max_total_response_size: config.max_total_response_size.as_u64(),
+        snapshot_exec: config.snapshot_exec.clone(),
+        checkpoint_interval: config.checkpoint_interval_s.map(Duration::from_secs),
+    })
+}
+
+async fn make_user_api_config(config: &Cli) -> anyhow::Result<UserApiConfig> {
+    let auth_jwt_key = if let Some(ref file_path) = config.auth_jwt_key_file {
+        let data = tokio::fs::read_to_string(file_path)
+            .await
+            .context("Could not read file with JWT key")?;
+        Some(data)
+    } else {
+        match env::var("SQLD_AUTH_JWT_KEY") {
+            Ok(key) => Some(key),
+            Err(env::VarError::NotPresent) => None,
+            Err(env::VarError::NotUnicode(_)) => {
+                bail!("Env variable SQLD_AUTH_JWT_KEY does not contain a valid Unicode value")
+            }
+        }
+    };
+    let http_acceptor =
+        AddrIncoming::new(tokio::net::TcpListener::bind(config.http_listen_addr).await?);
+    tracing::info!(
+        "listening for incoming user HTTP connection on {}",
+        config.http_listen_addr
+    );
+
+    let hrana_ws_acceptor = match config.hrana_listen_addr {
+        Some(addr) => {
+            let incoming = AddrIncoming::new(tokio::net::TcpListener::bind(addr).await?);
+
+            tracing::info!(
+                "listening for incoming user hrana websocket connection on {}",
+                addr
+            );
+
+            Some(incoming)
+        }
+        None => None,
+    };
+
+    Ok(UserApiConfig {
+        http_acceptor: Some(http_acceptor),
+        hrana_ws_acceptor,
+        enable_http_console: config.enable_http_console,
+        self_url: config.http_self_url.clone(),
+        http_auth: config.http_auth.clone(),
+        auth_jwt_key,
+    })
+}
+
+async fn make_admin_api_config(config: &Cli) -> anyhow::Result<Option<AdminApiConfig>> {
+    match config.admin_listen_addr {
+        Some(addr) => {
+            let acceptor = AddrIncoming::new(tokio::net::TcpListener::bind(addr).await?);
+
+            tracing::info!("listening for incoming adming HTTP connection on {}", addr);
+            let connector = hyper_rustls::HttpsConnectorBuilder::new()
+                .with_native_roots()
+                .https_or_http()
+                .enable_http1()
+                .build();
+
+            Ok(Some(AdminApiConfig {
+                acceptor,
+                connector,
+            }))
+        }
+        None => Ok(None),
+    }
+}
+
+async fn make_rpc_server_config(config: &Cli) -> anyhow::Result<Option<RpcServerConfig>> {
+    match config.grpc_listen_addr {
+        Some(addr) => {
+            let acceptor = AddrIncoming::new(tokio::net::TcpListener::bind(addr).await?);
+
+            tracing::info!("listening for incoming gRPC connection on {}", addr);
+
+            let tls_config = if config.grpc_tls {
+                Some(TlsConfig {
+                    cert: config
+                        .grpc_cert_file
+                        .clone()
+                        .context("server tls is enabled but cert file is missing")?,
+                    key: config
+                        .grpc_key_file
+                        .clone()
+                        .context("server tls is enabled but key file is missing")?,
+                    ca_cert: config
+                        .grpc_ca_cert_file
+                        .clone()
+                        .context("server tls is enabled but ca_cert file is missing")?,
+                })
+            } else {
+                None
+            };
+
+            Ok(Some(RpcServerConfig {
+                acceptor,
+                tls_config,
+            }))
+        }
+        None => Ok(None),
+    }
+}
+
+async fn make_rpc_client_config(config: &Cli) -> anyhow::Result<Option<RpcClientConfig>> {
+    match config.primary_grpc_url {
+        Some(ref url) => {
+            let mut connector = HttpConnector::new();
+            connector.enforce_http(false);
+            connector.set_nodelay(true);
+            let tls_config = if config.primary_grpc_tls {
+                Some(TlsConfig {
+                    cert: config
+                        .primary_grpc_cert_file
+                        .clone()
+                        .context("client tls is enabled but cert file is missing")?,
+                    key: config
+                        .primary_grpc_key_file
+                        .clone()
+                        .context("client tls is enabled but key file is missing")?,
+                    ca_cert: config
+                        .primary_grpc_ca_cert_file
+                        .clone()
+                        .context("client tls is enabled but ca_cert file is missing")?,
+                })
+            } else {
+                None
+            };
+
+            Ok(Some(RpcClientConfig {
+                remote_url: url.clone(),
+                connector,
+                tls_config,
+            }))
+        }
+        None => Ok(None),
+    }
+}
+
+fn make_hearbeat_config(config: &Cli) -> Option<HeartbeatConfig> {
+    Some(HeartbeatConfig {
+        heartbeat_url: config.heartbeat_url.clone()?,
+        heartbeat_period: Duration::from_secs(config.heartbeat_period_s),
+        heartbeat_auth: config.heartbeat_auth.clone(),
+    })
+}
+
+async fn build_server(config: &Cli) -> anyhow::Result<Server> {
+    let db_config = make_db_config(config)?;
+    let user_api_config = make_user_api_config(config).await?;
+    let admin_api_config = make_admin_api_config(config).await?;
+    let rpc_server_config = make_rpc_server_config(config).await?;
+    let rpc_client_config = make_rpc_client_config(config).await?;
+    let heartbeat_config = make_hearbeat_config(config);
+
+    let shutdown = Arc::new(Notify::new());
+    tokio::spawn({
+        let shutdown = shutdown.clone();
+        async move {
+            loop {
+                tokio::signal::ctrl_c()
+                    .await
+                    .expect("failed to listen to CTRL-C");
+                tracing::info!(
+                    "received CTRL-C, shutting down gracefully... This may take some time"
+                );
+                shutdown.notify_waiters();
+            }
+        }
+    });
+
+    Ok(Server {
+        path: config.db_path.clone().into(),
+        db_config,
+        user_api_config,
+        admin_api_config,
+        rpc_server_config,
+        rpc_client_config,
+        heartbeat_config,
+        idle_shutdown_timeout: config.idle_shutdown_timeout_s.map(Duration::from_secs),
+        initial_idle_shutdown_timeout: config
+            .initial_idle_shutdown_timeout_s
+            .map(Duration::from_secs),
+        disable_default_namespace: config.disable_default_namespace,
+        disable_namespaces: !config.enable_namespaces,
+        shutdown,
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    if std::env::var("RUST_LOG").is_err() {
+        std::env::set_var("RUST_LOG", "info");
+    }
+
     let registry = tracing_subscriber::registry();
 
     #[cfg(feature = "debug-tools")]
@@ -325,18 +504,16 @@ async fn main() -> Result<()> {
         .with(
             tracing_subscriber::fmt::layer()
                 .with_ansi(false)
-                .with_filter(
-                    tracing_subscriber::EnvFilter::builder()
-                        .with_default_directive(LevelFilter::INFO.into())
-                        .from_env_lossy(),
-                ),
+                .with_filter(tracing_subscriber::EnvFilter::from_default_env()),
         )
         .init();
+
+    std::panic::set_hook(Box::new(tracing_panic::panic_hook));
 
     let args = Cli::parse();
 
     match args.utils {
-        Some(UtilsSubcommands::Dump { path }) => {
+        Some(UtilsSubcommands::Dump { path, namespace }) => {
             if let Some(ref path) = path {
                 eprintln!(
                     "Dumping database {} to {}",
@@ -344,12 +521,17 @@ async fn main() -> Result<()> {
                     path.display()
                 );
             }
-            perform_dump(path.as_deref(), &args.db_path)
+            let db_path = args.db_path.join("dbs").join(&namespace);
+            if !db_path.exists() {
+                bail!("no database for namespace `{namespace}`");
+            }
+
+            perform_dump(path.as_deref(), &db_path)
         }
         None => {
             args.print_welcome_message();
-            let config = config_from_args(args)?;
-            sqld::run_server(config).await?;
+            let server = build_server(&args).await?;
+            server.start().await?;
 
             Ok(())
         }

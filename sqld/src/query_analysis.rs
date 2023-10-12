@@ -28,6 +28,8 @@ pub enum StmtKind {
     TxnEnd,
     Read,
     Write,
+    Savepoint,
+    Release,
     Other,
 }
 
@@ -51,7 +53,13 @@ impl StmtKind {
             Cmd::Explain(_) => Some(Self::Other),
             Cmd::ExplainQueryPlan(_) => Some(Self::Other),
             Cmd::Stmt(Stmt::Begin { .. }) => Some(Self::TxnBegin),
-            Cmd::Stmt(Stmt::Commit { .. } | Stmt::Rollback { .. }) => Some(Self::TxnEnd),
+            Cmd::Stmt(
+                Stmt::Commit { .. }
+                | Stmt::Rollback {
+                    savepoint_name: None,
+                    ..
+                },
+            ) => Some(Self::TxnEnd),
             Cmd::Stmt(
                 Stmt::CreateVirtualTable { tbl_name, .. }
                 | Stmt::CreateTable {
@@ -85,6 +93,7 @@ impl StmtKind {
             Cmd::Stmt(Stmt::AlterTable(tbl_name, _)) => write_if_not_reserved(tbl_name),
             Cmd::Stmt(
                 Stmt::DropIndex { .. }
+                | Stmt::DropTrigger { .. }
                 | Stmt::CreateTrigger {
                     temporary: false, ..
                 }
@@ -92,6 +101,18 @@ impl StmtKind {
             ) => Some(Self::Write),
             Cmd::Stmt(Stmt::Select { .. }) => Some(Self::Read),
             Cmd::Stmt(Stmt::Pragma(name, body)) => Self::pragma_kind(name, body.as_ref()),
+            // Creating regular views is OK, temporary views are bound to a connection
+            // and thus disallowed in sqld.
+            Cmd::Stmt(Stmt::CreateView {
+                temporary: false, ..
+            }) => Some(Self::Write),
+            Cmd::Stmt(Stmt::DropView { .. }) => Some(Self::Write),
+            Cmd::Stmt(Stmt::Savepoint(_)) => Some(Self::Savepoint),
+            Cmd::Stmt(Stmt::Release(_))
+            | Cmd::Stmt(Stmt::Rollback {
+                savepoint_name: Some(_),
+                ..
+            }) => Some(Self::Release),
             _ => None,
         }
     }
@@ -109,7 +130,7 @@ impl StmtKind {
             // always ok to be served by primary
             "foreign_keys" | "foreign_key_list" | "foreign_key_check" | "collation_list"
             | "data_version" | "freelist_count" | "integrity_check" | "legacy_file_format"
-            | "page_count" | "quick_check" | "stats" => Some(Self::Write),
+            | "page_count" | "quick_check" | "stats" | "user_version" => Some(Self::Write),
             // ok to be served by primary without args
             "analysis_limit"
             | "application_id"
@@ -141,7 +162,6 @@ impl StmtKind {
             | "temp_store"
             | "threads"
             | "trusted_schema"
-            | "user_version"
             | "wal_autocheckpoint" => {
                 match body {
                     Some(_) => None,
@@ -160,6 +180,22 @@ impl StmtKind {
                 None
             },
         }
+    }
+
+    /// Returns `true` if the stmt kind is [`Savepoint`].
+    ///
+    /// [`Savepoint`]: StmtKind::Savepoint
+    #[must_use]
+    pub fn is_savepoint(&self) -> bool {
+        matches!(self, Self::Savepoint)
+    }
+
+    /// Returns `true` if the stmt kind is [`Release`].
+    ///
+    /// [`Release`]: StmtKind::Release
+    #[must_use]
+    pub fn is_release(&self) -> bool {
+        matches!(self, Self::Release)
     }
 }
 
@@ -182,6 +218,7 @@ impl State {
             (state, StmtKind::Other | StmtKind::Write | StmtKind::Read) => state,
             (State::Invalid, _) => State::Invalid,
             (State::Init, StmtKind::TxnBegin) => State::Txn,
+            _ => State::Invalid,
         };
     }
 
@@ -208,8 +245,8 @@ impl Statement {
             has_more_stmts: bool,
             c: Cmd,
         ) -> Result<Statement> {
-            let kind =
-                StmtKind::kind(&c).ok_or_else(|| anyhow::anyhow!("unsupported statement"))?;
+            let kind = StmtKind::kind(&c)
+                .ok_or_else(|| anyhow::anyhow!("unsupported statement: {original}"))?;
 
             if stmt_count == 1 && !has_more_stmts {
                 // XXX: Temporary workaround for integration with Atlas
@@ -270,7 +307,11 @@ impl Statement {
     pub fn is_read_only(&self) -> bool {
         matches!(
             self.kind,
-            StmtKind::Read | StmtKind::TxnEnd | StmtKind::TxnBegin
+            StmtKind::Read
+                | StmtKind::TxnEnd
+                | StmtKind::TxnBegin
+                | StmtKind::Release
+                | StmtKind::Savepoint
         )
     }
 }

@@ -7,16 +7,19 @@ use std::os::unix::prelude::FileExt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use anyhow::Context;
 use bytemuck::{bytes_of, pod_read_unaligned, Pod, Zeroable};
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 use crossbeam::channel::bounded;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use tempfile::NamedTempFile;
 use uuid::Uuid;
+
+use crate::namespace::NamespaceName;
 
 use super::frame::Frame;
 use super::primary::logger::LogFile;
@@ -53,17 +56,19 @@ pub struct SnapshotFile {
 fn parse_snapshot_name(name: &str) -> Option<(Uuid, u64, u64)> {
     static SNAPSHOT_FILE_MATCHER: Lazy<Regex> = Lazy::new(|| {
         Regex::new(
-            r#"(?x)
+            r"(?x)
             # match database id
             (\w{8}-\w{4}-\w{4}-\w{4}-\w{12})-
             # match start frame_no
             (\d*)-
             # match end frame_no
-            (\d*).snap"#,
+            (\d*).snap",
         )
         .unwrap()
     });
-    let Some(captures) = SNAPSHOT_FILE_MATCHER.captures(name) else { return None};
+    let Some(captures) = SNAPSHOT_FILE_MATCHER.captures(name) else {
+        return None;
+    };
     let db_id = captures.get(1).unwrap();
     let start_index: u64 = captures.get(2).unwrap().as_str().parse().unwrap();
     let end_index: u64 = captures.get(3).unwrap().as_str().parse().unwrap();
@@ -79,10 +84,16 @@ fn snapshot_list(db_path: &Path) -> anyhow::Result<impl Iterator<Item = String>>
     let mut entries = std::fs::read_dir(snapshot_dir_path(db_path))?;
     Ok(std::iter::from_fn(move || {
         for entry in entries.by_ref() {
-            let Ok(entry) = entry else { continue; };
+            let Ok(entry) = entry else {
+                continue;
+            };
             let path = entry.path();
-            let Some(name) = path.file_name() else {continue;};
-            let Some(name_str) = name.to_str() else { continue;};
+            let Some(name) = path.file_name() else {
+                continue;
+            };
+            let Some(name_str) = name.to_str() else {
+                continue;
+            };
 
             return Some(name_str.to_string());
         }
@@ -97,7 +108,9 @@ pub fn find_snapshot_file(
 ) -> anyhow::Result<Option<SnapshotFile>> {
     let snapshot_dir_path = snapshot_dir_path(db_path);
     for name in snapshot_list(db_path)? {
-        let Some((_, start_frame_no, end_frame_no)) = parse_snapshot_name(&name) else { continue; };
+        let Some((_, start_frame_no, end_frame_no)) = parse_snapshot_name(&name) else {
+            continue;
+        };
         // we're looking for the frame right after the last applied frame on the replica
         if (start_frame_no..=end_frame_no).contains(&frame_no) {
             let snapshot_path = snapshot_dir_path.join(&name);
@@ -121,7 +134,7 @@ impl SnapshotFile {
     }
 
     /// Iterator on the frames contained in the snapshot file, in reverse frame_no order.
-    pub fn frames_iter(&self) -> impl Iterator<Item = anyhow::Result<Bytes>> + '_ {
+    pub fn frames_iter(&self) -> impl Iterator<Item = anyhow::Result<Frame>> + '_ {
         let mut current_offset = 0;
         std::iter::from_fn(move || {
             if current_offset >= self.header.frame_count {
@@ -132,7 +145,10 @@ impl SnapshotFile {
             current_offset += 1;
             let mut buf = BytesMut::zeroed(LogFile::FRAME_SIZE);
             match self.file.read_exact_at(&mut buf, read_offset as _) {
-                Ok(_) => Some(Ok(buf.freeze())),
+                Ok(_) => match Frame::try_from_bytes(buf.freeze()) {
+                    Ok(frame) => Some(Ok(frame)),
+                    Err(e) => Some(Err(e)),
+                },
                 Err(e) => Some(Err(e.into())),
             }
         })
@@ -142,31 +158,32 @@ impl SnapshotFile {
     pub fn frames_iter_from(
         &self,
         frame_no: u64,
-    ) -> impl Iterator<Item = anyhow::Result<Bytes>> + '_ {
+    ) -> impl Iterator<Item = anyhow::Result<Frame>> + '_ {
         let mut iter = self.frames_iter();
         std::iter::from_fn(move || match iter.next() {
-            Some(Ok(bytes)) => match Frame::try_from_bytes(bytes.clone()) {
-                Ok(frame) => {
-                    if frame.header().frame_no < frame_no {
-                        None
-                    } else {
-                        Some(Ok(bytes))
-                    }
+            Some(Ok(frame)) => {
+                if frame.header().frame_no < frame_no {
+                    None
+                } else {
+                    Some(Ok(frame))
                 }
-                Err(e) => Some(Err(e)),
-            },
+            }
             other => other,
         })
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct LogCompactor {
     sender: crossbeam::channel::Sender<(LogFile, PathBuf, u32)>,
 }
 
+pub type SnapshotCallback = Box<dyn Fn(&Path) -> anyhow::Result<()> + Send + Sync>;
+pub type NamespacedSnapshotCallback =
+    Arc<dyn Fn(&Path, &NamespaceName) -> anyhow::Result<()> + Send + Sync>;
+
 impl LogCompactor {
-    pub fn new(db_path: &Path, db_id: u128) -> anyhow::Result<Self> {
+    pub fn new(db_path: &Path, db_id: u128, callback: SnapshotCallback) -> anyhow::Result<Self> {
         // we create a 0 sized channel, in order to create backpressure when we can't
         // keep up with snapshop creation: if there isn't any ongoind comptaction task processing,
         // the compact does not block, and the log is compacted in the background. Otherwise, the
@@ -174,11 +191,19 @@ impl LogCompactor {
         let (sender, receiver) = bounded::<(LogFile, PathBuf, u32)>(0);
         let mut merger = SnapshotMerger::new(db_path, db_id)?;
         let db_path = db_path.to_path_buf();
+        let snapshot_dir_path = snapshot_dir_path(&db_path);
         let _handle = std::thread::spawn(move || {
             while let Ok((file, log_path, size_after)) = receiver.recv() {
                 match perform_compaction(&db_path, file, db_id) {
                     Ok((snapshot_name, snapshot_frame_count)) => {
                         tracing::info!("snapshot `{snapshot_name}` successfully created");
+
+                        let snapshot_file = snapshot_dir_path.join(&snapshot_name);
+                        if let Err(e) = (*callback)(&snapshot_file) {
+                            tracing::error!("failed to call snapshot callback: {e}");
+                            break;
+                        }
+
                         if let Err(e) = merger.register_snapshot(
                             snapshot_name,
                             snapshot_frame_count,
@@ -304,7 +329,7 @@ impl SnapshotMerger {
         let snapshot_dir_path = snapshot_dir_path(db_path);
         for (name, _) in snapshots.iter().rev() {
             let snapshot = SnapshotFile::open(&snapshot_dir_path.join(name))?;
-            let iter = snapshot.frames_iter().map(|b| Frame::try_from_bytes(b?));
+            let iter = snapshot.frames_iter();
             builder.append_frames(iter)?;
         }
 
@@ -455,7 +480,6 @@ mod test {
     use bytes::Bytes;
     use tempfile::tempdir;
 
-    use crate::replication::frame::FrameHeader;
     use crate::replication::primary::logger::WalPage;
     use crate::replication::snapshot::SnapshotFile;
 
@@ -464,7 +488,7 @@ mod test {
     #[test]
     fn compact_file_create_snapshot() {
         let temp = tempfile::NamedTempFile::new().unwrap();
-        let mut log_file = LogFile::new(temp.as_file().try_clone().unwrap(), 0).unwrap();
+        let mut log_file = LogFile::new(temp.as_file().try_clone().unwrap(), 0, None).unwrap();
         let db_id = Uuid::new_v4();
         log_file.header.db_id = db_id.as_u128();
         log_file.write_header().unwrap();
@@ -485,7 +509,8 @@ mod test {
         log_file.commit().unwrap();
 
         let dump_dir = tempdir().unwrap();
-        let compactor = LogCompactor::new(dump_dir.path(), db_id.as_u128()).unwrap();
+        let compactor =
+            LogCompactor::new(dump_dir.path(), db_id.as_u128(), Box::new(|_| Ok(()))).unwrap();
         compactor
             .compact(log_file, temp.path().to_path_buf(), 25)
             .unwrap();
@@ -525,8 +550,7 @@ mod test {
         let mut expected_frame_no = 49;
         for frame in frames {
             let frame = frame.unwrap();
-            let header: FrameHeader = pod_read_unaligned(&frame[..size_of::<FrameHeader>()]);
-            assert_eq!(header.frame_no, expected_frame_no);
+            assert_eq!(frame.header().frame_no, expected_frame_no);
             expected_frame_no -= 1;
         }
 

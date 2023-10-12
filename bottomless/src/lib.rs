@@ -8,12 +8,14 @@ mod backup;
 mod read;
 pub mod replicator;
 mod transaction_cache;
+pub mod uuid_utils;
 mod wal;
 
 use crate::ffi::{
     bottomless_methods, libsql_wal_methods, sqlite3, sqlite3_file, sqlite3_vfs, PgHdr, Wal,
 };
 use std::ffi::{c_char, c_void};
+use tokio::time::Instant;
 
 // Just heuristics, but should work for ~100% of cases
 fn is_regular(vfs: *const sqlite3_vfs) -> bool {
@@ -256,7 +258,10 @@ pub extern "C" fn xFrames(
             return ffi::SQLITE_IOERR_WRITE;
         }
         let frame_count = ffi::PageHdrIter::new(page_headers, page_size as usize).count();
-        ctx.replicator.submit_frames(frame_count as u32);
+        if size_after != 0 {
+            // only submit frames from committed transactions
+            ctx.replicator.submit_frames(frame_count as u32);
+        }
     }
 
     let orig_methods = get_orig_methods(wal);
@@ -296,6 +301,7 @@ pub extern "C" fn xCheckpoint(
     backfilled_frames: *mut i32,
 ) -> i32 {
     tracing::trace!("Checkpoint");
+    let start = Instant::now();
 
     /* In order to avoid partial checkpoints, passive checkpoint
      ** mode is not allowed. Only TRUNCATE checkpoints are accepted,
@@ -308,6 +314,31 @@ pub extern "C" fn xCheckpoint(
         tracing::trace!("Ignoring a checkpoint request weaker than TRUNCATE");
         return ffi::SQLITE_OK;
     }
+
+    let ctx = get_replicator_context(wal);
+    let last_known_frame = ctx.replicator.last_known_frame();
+    ctx.replicator.request_flush();
+    if last_known_frame == 0 {
+        tracing::debug!("No committed changes in this generation, not snapshotting");
+        ctx.replicator.skip_snapshot_for_current_generation();
+        return ffi::SQLITE_OK;
+    }
+    if let Err(e) = block_on!(
+        ctx.runtime,
+        ctx.replicator.wait_until_committed(last_known_frame)
+    ) {
+        tracing::error!(
+            "Failed to finalize frame {} replication: {}",
+            last_known_frame,
+            e
+        );
+        return ffi::SQLITE_IOERR_WRITE;
+    }
+    if let Err(e) = block_on!(ctx.runtime, ctx.replicator.wait_until_snapshotted()) {
+        tracing::error!("Failed to finalize snapshot replication: {}", e);
+        return ffi::SQLITE_IOERR_WRITE;
+    }
+
     /* If there's no busy handler, let's provide a default one,
      ** since we auto-upgrade the passive checkpoint
      */
@@ -336,32 +367,21 @@ pub extern "C" fn xCheckpoint(
         return rc;
     }
 
-    let ctx = get_replicator_context(wal);
-    if ctx.replicator.commits_in_current_generation() == 0 {
-        tracing::debug!("No commits happened in this generation, not snapshotting");
-        return ffi::SQLITE_OK;
-    }
-
-    let last_known_frame = ctx.replicator.last_known_frame();
-    ctx.replicator.request_flush();
-    if let Err(e) = block_on!(
-        ctx.runtime,
-        ctx.replicator.wait_until_committed(last_known_frame)
-    ) {
-        tracing::error!("Failed to finalize replication: {}", e);
-        return ffi::SQLITE_IOERR_WRITE;
-    }
-
-    ctx.replicator.new_generation();
+    let _prev = ctx.replicator.new_generation();
     tracing::debug!("Snapshotting after checkpoint");
-    let result = block_on!(ctx.runtime, ctx.replicator.snapshot_main_db_file());
-    if let Err(e) = result {
-        tracing::error!(
-            "Failed to snapshot the main db file during checkpoint: {}",
-            e
-        );
-        return ffi::SQLITE_IOERR_WRITE;
+    match block_on!(ctx.runtime, ctx.replicator.snapshot_main_db_file()) {
+        Ok(_handle) => {
+            tracing::trace!("got snapshot handle");
+        }
+        Err(e) => {
+            tracing::error!(
+                "Failed to snapshot the main db file during checkpoint: {}",
+                e
+            );
+            return ffi::SQLITE_IOERR_WRITE;
+        }
     }
+    tracing::debug!("Checkpoint completed in {:?}", Instant::now() - start);
 
     ffi::SQLITE_OK
 }
@@ -408,12 +428,20 @@ pub extern "C" fn xGetPathname(buf: *mut c_char, orig: *const c_char, orig_len: 
 
 async fn try_restore(replicator: &mut replicator::Replicator) -> i32 {
     match replicator.restore(None, None).await {
-        Ok(replicator::RestoreAction::None) => (),
-        Ok(replicator::RestoreAction::SnapshotMainDbFile) => {
+        Ok((replicator::RestoreAction::SnapshotMainDbFile, _)) => {
             replicator.new_generation();
-            if let Err(e) = replicator.snapshot_main_db_file().await {
-                tracing::error!("Failed to snapshot the main db file: {}", e);
-                return ffi::SQLITE_CANTOPEN;
+            match replicator.snapshot_main_db_file().await {
+                Ok(Some(h)) => {
+                    if let Err(e) = h.await {
+                        tracing::error!("Failed to join snapshot main db file task: {}", e);
+                        return ffi::SQLITE_CANTOPEN;
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::error!("Failed to snapshot the main db file: {}", e);
+                    return ffi::SQLITE_CANTOPEN;
+                }
             }
             // Restoration process only leaves the local WAL file if it was
             // detected to be newer than its remote counterpart.
@@ -422,7 +450,7 @@ async fn try_restore(replicator: &mut replicator::Replicator) -> i32 {
                 return ffi::SQLITE_CANTOPEN;
             }
         }
-        Ok(replicator::RestoreAction::ReuseGeneration(gen)) => {
+        Ok((replicator::RestoreAction::ReuseGeneration(gen), _)) => {
             replicator.set_generation(gen);
         }
         Err(e) => {
@@ -555,7 +583,9 @@ pub mod static_init {
         INIT.call_once(|| {
             crate::bottomless_init();
             let orig_methods = unsafe { libsql_wal_methods_find(std::ptr::null()) };
-            if orig_methods.is_null() {}
+            if orig_methods.is_null() {
+                panic!("failed to locate default WAL methods")
+            }
             let methods = crate::bottomless_methods(orig_methods);
             let rc = unsafe { libsql_wal_methods_register(methods) };
             if rc != crate::ffi::SQLITE_OK {

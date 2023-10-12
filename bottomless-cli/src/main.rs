@@ -1,7 +1,8 @@
 use anyhow::Result;
 use aws_sdk_s3::Client;
-use chrono::Utc;
+use chrono::NaiveDateTime;
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 mod replicator_extras;
 use crate::replicator_extras::detect_db;
@@ -19,6 +20,8 @@ struct Cli {
     bucket: Option<String>,
     #[clap(long, short)]
     database: Option<String>,
+    #[clap(long, short)]
+    namespace: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -64,9 +67,26 @@ enum Commands {
         #[clap(
             long,
             short,
+            conflicts_with = "generation",
             long_help = "UTC timestamp which is an upper bound for the transactions to be restored."
         )]
-        utc_time: Option<chrono::DateTime<Utc>>,
+        utc_time: Option<NaiveDateTime>,
+    },
+    #[clap(about = "Verify integrity of the database")]
+    Verify {
+        #[clap(
+            long,
+            short,
+            long_help = "Generation to verify.\nSkip this parameter to verify the newest generation."
+        )]
+        generation: Option<uuid::Uuid>,
+        #[clap(
+            long,
+            short,
+            conflicts_with = "generation",
+            long_help = "UTC timestamp which is an upper bound for the transactions to be verified."
+        )]
+        utc_time: Option<NaiveDateTime>,
     },
     #[clap(about = "Remove given generation from remote storage")]
     Rm {
@@ -85,16 +105,21 @@ enum Commands {
 
 async fn run() -> Result<()> {
     tracing_subscriber::fmt::init();
-    let options = Cli::parse();
+    let mut options = Cli::parse();
 
     if let Some(ep) = options.endpoint.as_deref() {
         std::env::set_var("LIBSQL_BOTTOMLESS_ENDPOINT", ep)
+    } else {
+        options.endpoint = std::env::var("LIBSQL_BOTTOMLESS_ENDPOINT").ok();
     }
 
     if let Some(bucket) = options.bucket.as_deref() {
         std::env::set_var("LIBSQL_BOTTOMLESS_BUCKET", bucket)
+    } else {
+        options.bucket = std::env::var("LIBSQL_BOTTOMLESS_BUCKET").ok();
     }
-
+    let namespace = options.namespace.as_deref().unwrap_or("ns-default");
+    std::env::set_var("LIBSQL_BOTTOMLESS_DATABASE_ID", namespace);
     let database = match options.database.clone() {
         Some(db) => db,
         None => {
@@ -108,7 +133,7 @@ async fn run() -> Result<()> {
                     .build()
             });
             let bucket = options.bucket.as_deref().unwrap_or("bottomless");
-            match detect_db(&client, bucket, "").await {
+            match detect_db(&client, bucket, namespace).await {
                 Some(db) => db,
                 None => {
                     println!("Could not autodetect the database. Please pass it explicitly with -d option");
@@ -117,9 +142,11 @@ async fn run() -> Result<()> {
             }
         }
     };
-    tracing::info!("Database: {}", database);
+    let database_dir = database + "/dbs/" + namespace.strip_prefix("ns-").unwrap();
+    let database = database_dir.clone() + "/data";
+    tracing::info!("Database: '{}' (namespace: {})", database, namespace);
 
-    let mut client = Replicator::new(database).await?;
+    let mut client = Replicator::new(database.clone()).await?;
 
     match options.command {
         Commands::Ls {
@@ -140,7 +167,32 @@ async fn run() -> Result<()> {
             generation,
             utc_time,
         } => {
+            tokio::fs::create_dir_all(&database_dir).await?;
             client.restore(generation, utc_time).await?;
+            let db_path = PathBuf::from(&database);
+            if let Err(e) = verify_db(&db_path) {
+                println!("Verification failed: {e}");
+                std::process::exit(1)
+            }
+            println!("Verification: ok");
+        }
+        Commands::Verify {
+            generation,
+            utc_time,
+        } => {
+            let temp = std::env::temp_dir().join("bottomless-verification-do-not-touch");
+            let mut client = Replicator::new(temp.display().to_string()).await?;
+            let _ = tokio::fs::remove_file(&temp).await;
+            client.restore(generation, utc_time).await?;
+            let size = tokio::fs::metadata(&temp).await?.len();
+            println!("Snapshot size: {size}");
+            let result = verify_db(&temp);
+            let _ = tokio::fs::remove_file(&temp).await;
+            if let Err(e) = result {
+                println!("Verification failed: {e}");
+                std::process::exit(1)
+            }
+            println!("Verification: ok");
         }
         Commands::Rm {
             generation,
@@ -156,6 +208,18 @@ async fn run() -> Result<()> {
         },
     };
     Ok(())
+}
+
+fn verify_db(path: &PathBuf) -> Result<()> {
+    let conn = rusqlite::Connection::open(path)?;
+    let mut stmt = conn.prepare("PRAGMA integrity_check")?;
+    let mut rows = stmt.query(())?;
+    let result: String = rows.next()?.unwrap().get(0)?;
+    if result == "ok" {
+        Ok(())
+    } else {
+        anyhow::bail!("{result}")
+    }
 }
 
 #[tokio::main]

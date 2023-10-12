@@ -3,12 +3,12 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use async_lock::{RwLock, RwLockUpgradableReadGuard};
-use tokio::sync::watch;
 use uuid::Uuid;
 
-use crate::auth::{Authenticated, Authorized};
-use crate::database::factory::DbFactory;
-use crate::database::{Database, Program};
+use crate::auth::{Auth, Authenticated};
+use crate::connection::Connection;
+use crate::database::{Database, PrimaryConnection};
+use crate::namespace::{NamespaceStore, PrimaryNamespaceMaker};
 use crate::query_result_builder::{
     Column, QueryBuilderConfig, QueryResultBuilder, QueryResultBuilderError,
 };
@@ -16,7 +16,11 @@ use crate::replication::FrameNo;
 
 use self::rpc::proxy_server::Proxy;
 use self::rpc::query_result::RowResult;
-use self::rpc::{Ack, DisconnectMessage, ExecuteResults, QueryResult, ResultRows, Row};
+use self::rpc::{
+    describe_result, Ack, DescribeRequest, DescribeResult, Description, DisconnectMessage,
+    ExecuteResults, QueryResult, ResultRows, Row,
+};
+use super::NAMESPACE_DOESNT_EXIST;
 
 pub mod rpc {
     #![allow(clippy::all)]
@@ -26,7 +30,7 @@ pub mod rpc {
     use anyhow::Context;
 
     use crate::query_analysis::Statement;
-    use crate::{database, error::Error as SqldError};
+    use crate::{connection, error::Error as SqldError};
 
     use self::{error::ErrorCode, execute_results::State};
     tonic::include_proto!("proxy");
@@ -124,7 +128,7 @@ pub mod rpc {
         }
     }
 
-    impl TryFrom<Program> for database::Program {
+    impl TryFrom<Program> for connection::program::Program {
         type Error = anyhow::Error;
 
         fn try_from(pgm: Program) -> Result<Self, Self::Error> {
@@ -138,7 +142,7 @@ pub mod rpc {
         }
     }
 
-    impl TryFrom<Step> for database::Step {
+    impl TryFrom<Step> for connection::program::Step {
         type Error = anyhow::Error;
 
         fn try_from(step: Step) -> Result<Self, Self::Error> {
@@ -149,7 +153,7 @@ pub mod rpc {
         }
     }
 
-    impl TryFrom<Cond> for database::Cond {
+    impl TryFrom<Cond> for connection::program::Cond {
         type Error = anyhow::Error;
 
         fn try_from(cond: Cond) -> Result<Self, Self::Error> {
@@ -171,6 +175,7 @@ pub mod rpc {
                         .map(TryInto::try_into)
                         .collect::<anyhow::Result<_>>()?,
                 },
+                Some(cond::Cond::IsAutocommit(_)) => Self::IsAutocommit,
                 None => anyhow::bail!("invalid condition"),
             };
 
@@ -197,8 +202,8 @@ pub mod rpc {
         }
     }
 
-    impl From<database::Program> for Program {
-        fn from(pgm: database::Program) -> Self {
+    impl From<connection::program::Program> for Program {
+        fn from(pgm: connection::program::Program) -> Self {
             // TODO: use unwrap_or_clone when stable
             let steps = match Arc::try_unwrap(pgm.steps) {
                 Ok(steps) => steps,
@@ -221,8 +226,8 @@ pub mod rpc {
         }
     }
 
-    impl From<database::Step> for Step {
-        fn from(step: database::Step) -> Self {
+    impl From<connection::program::Step> for Step {
+        fn from(step: connection::program::Step) -> Self {
             Self {
                 cond: step.cond.map(|c| c.into()),
                 query: Some(step.query.into()),
@@ -230,20 +235,27 @@ pub mod rpc {
         }
     }
 
-    impl From<database::Cond> for Cond {
-        fn from(cond: database::Cond) -> Self {
+    impl From<connection::program::Cond> for Cond {
+        fn from(cond: connection::program::Cond) -> Self {
             let cond = match cond {
-                database::Cond::Ok { step } => cond::Cond::Ok(OkCond { step: step as i64 }),
-                database::Cond::Err { step } => cond::Cond::Err(ErrCond { step: step as i64 }),
-                database::Cond::Not { cond } => cond::Cond::Not(Box::new(NotCond {
+                connection::program::Cond::Ok { step } => {
+                    cond::Cond::Ok(OkCond { step: step as i64 })
+                }
+                connection::program::Cond::Err { step } => {
+                    cond::Cond::Err(ErrCond { step: step as i64 })
+                }
+                connection::program::Cond::Not { cond } => cond::Cond::Not(Box::new(NotCond {
                     cond: Some(Box::new(Cond::from(*cond))),
                 })),
-                database::Cond::Or { conds } => cond::Cond::Or(OrCond {
+                connection::program::Cond::Or { conds } => cond::Cond::Or(OrCond {
                     conds: conds.into_iter().map(|c| c.into()).collect(),
                 }),
-                database::Cond::And { conds } => cond::Cond::And(AndCond {
+                connection::program::Cond::And { conds } => cond::Cond::And(AndCond {
                     conds: conds.into_iter().map(|c| c.into()).collect(),
                 }),
+                connection::program::Cond::IsAutocommit => {
+                    cond::Cond::IsAutocommit(IsAutocommitCond {})
+                }
             };
 
             Self { cond: Some(cond) }
@@ -251,22 +263,29 @@ pub mod rpc {
     }
 }
 
-pub struct ProxyService<D> {
-    clients: RwLock<HashMap<Uuid, Arc<D>>>,
-    factory: Arc<dyn DbFactory<Db = D>>,
-    new_frame_notifier: watch::Receiver<FrameNo>,
+pub struct ProxyService {
+    clients: Arc<RwLock<HashMap<Uuid, Arc<PrimaryConnection>>>>,
+    namespaces: NamespaceStore<PrimaryNamespaceMaker>,
+    auth: Option<Arc<Auth>>,
+    disable_namespaces: bool,
 }
 
-impl<D: Database> ProxyService<D> {
+impl ProxyService {
     pub fn new(
-        factory: Arc<dyn DbFactory<Db = D>>,
-        new_frame_notifier: watch::Receiver<FrameNo>,
+        namespaces: NamespaceStore<PrimaryNamespaceMaker>,
+        auth: Option<Arc<Auth>>,
+        disable_namespaces: bool,
     ) -> Self {
         Self {
             clients: Default::default(),
-            factory,
-            new_frame_notifier,
+            namespaces,
+            auth,
+            disable_namespaces,
         }
+    }
+
+    pub fn clients(&self) -> Arc<RwLock<HashMap<Uuid, Arc<PrimaryConnection>>>> {
+        self.clients.clone()
     }
 }
 
@@ -416,7 +435,7 @@ impl QueryResultBuilder for ExecuteResultBuilder {
         Ok(())
     }
 
-    fn finish(&mut self) -> Result<(), QueryResultBuilderError> {
+    fn finish(&mut self, _last_frame_no: Option<FrameNo>) -> Result<(), QueryResultBuilderError> {
         Ok(())
     }
 
@@ -425,33 +444,56 @@ impl QueryResultBuilder for ExecuteResultBuilder {
     }
 }
 
+// Disconnects all clients that have been idle for more than 30 seconds.
+// FIXME: we should also keep a list of recently disconnected clients,
+// and if one should arrive with a late message, it should be rejected
+// with an error. A similar mechanism is already implemented in hrana-over-http.
+pub async fn garbage_collect(clients: &mut HashMap<Uuid, Arc<PrimaryConnection>>) {
+    let limit = std::time::Duration::from_secs(30);
+
+    clients.retain(|_, db| db.idle_time() < limit);
+    tracing::trace!("gc: remaining client handles count: {}", clients.len());
+}
+
 #[tonic::async_trait]
-impl<D: Database> Proxy for ProxyService<D> {
+impl Proxy for ProxyService {
     async fn execute(
         &self,
         req: tonic::Request<rpc::ProgramReq>,
     ) -> Result<tonic::Response<ExecuteResults>, tonic::Status> {
+        let auth = if let Some(auth) = &self.auth {
+            auth.authenticate_grpc(&req, self.disable_namespaces)?
+        } else {
+            Authenticated::from_proxy_grpc_request(&req, self.disable_namespaces)?
+        };
+        let namespace = super::extract_namespace(self.disable_namespaces, &req)?;
         let req = req.into_inner();
-        let pgm = Program::try_from(req.pgm.unwrap())
+        let pgm = crate::connection::program::Program::try_from(req.pgm.unwrap())
             .map_err(|e| tonic::Status::new(tonic::Code::InvalidArgument, e.to_string()))?;
         let client_id = Uuid::from_str(&req.client_id).unwrap();
-        let auth = match req.authorized {
-            Some(0) => Authenticated::Authorized(Authorized::ReadOnly),
-            Some(1) => Authenticated::Authorized(Authorized::FullAccess),
-            Some(_) => {
-                return Err(tonic::Status::new(
-                    tonic::Code::PermissionDenied,
-                    "invalid authorization level",
-                ))
-            }
-            None => Authenticated::Anonymous,
-        };
+
+        let (connection_maker, new_frame_notifier) = self
+            .namespaces
+            .with(namespace, |ns| {
+                let connection_maker = ns.db.connection_maker();
+                let notifier = ns.db.logger.new_frame_notifier.subscribe();
+                (connection_maker, notifier)
+            })
+            .await
+            .map_err(|e| {
+                if let crate::error::Error::NamespaceDoesntExist(_) = e {
+                    tonic::Status::failed_precondition(NAMESPACE_DOESNT_EXIST)
+                } else {
+                    tonic::Status::internal(e.to_string())
+                }
+            })?;
+
         let lock = self.clients.upgradable_read().await;
         let db = match lock.get(&client_id) {
             Some(db) => db.clone(),
             None => {
                 tracing::debug!("connected: {client_id}");
-                match self.factory.create().await {
+                match connection_maker.create().await {
                     Ok(db) => {
                         let db = Arc::new(db);
                         let mut lock = RwLockUpgradableReadGuard::upgrade(lock).await;
@@ -464,14 +506,15 @@ impl<D: Database> Proxy for ProxyService<D> {
         };
 
         tracing::debug!("executing request for {client_id}");
+
         let builder = ExecuteResultBuilder::default();
         let (results, state) = db
-            .execute_program(pgm, auth, builder)
+            .execute_program(pgm, auth, builder, None)
             .await
             // TODO: this is no necessarily a permission denied error!
             .map_err(|e| tonic::Status::new(tonic::Code::PermissionDenied, e.to_string()))?;
-        let current_frame_no = *self.new_frame_notifier.borrow();
 
+        let current_frame_no = *new_frame_notifier.borrow();
         Ok(tonic::Response::new(ExecuteResults {
             current_frame_no,
             results: results.into_ret(),
@@ -492,5 +535,84 @@ impl<D: Database> Proxy for ProxyService<D> {
         self.clients.write().await.remove(&client_id);
 
         Ok(tonic::Response::new(Ack {}))
+    }
+
+    async fn describe(
+        &self,
+        msg: tonic::Request<DescribeRequest>,
+    ) -> Result<tonic::Response<DescribeResult>, tonic::Status> {
+        let auth = if let Some(auth) = &self.auth {
+            auth.authenticate_grpc(&msg, self.disable_namespaces)?
+        } else {
+            Authenticated::from_proxy_grpc_request(&msg, self.disable_namespaces)?
+        };
+
+        // FIXME: copypasta from execute(), creatively extract to a helper function
+        let namespace = super::extract_namespace(self.disable_namespaces, &msg)?;
+        let lock = self.clients.upgradable_read().await;
+        let (connection_maker, _new_frame_notifier) = self
+            .namespaces
+            .with(namespace, |ns| {
+                let connection_maker = ns.db.connection_maker();
+                let notifier = ns.db.logger.new_frame_notifier.subscribe();
+                (connection_maker, notifier)
+            })
+            .await
+            .map_err(|e| {
+                if let crate::error::Error::NamespaceDoesntExist(_) = e {
+                    tonic::Status::failed_precondition(NAMESPACE_DOESNT_EXIST)
+                } else {
+                    tonic::Status::internal(e.to_string())
+                }
+            })?;
+
+        let DescribeRequest { client_id, stmt } = msg.into_inner();
+        let client_id = Uuid::from_str(&client_id).unwrap();
+
+        let db = match lock.get(&client_id) {
+            Some(db) => db.clone(),
+            None => {
+                tracing::debug!("connected: {client_id}");
+                match connection_maker.create().await {
+                    Ok(db) => {
+                        let db = Arc::new(db);
+                        let mut lock = RwLockUpgradableReadGuard::upgrade(lock).await;
+                        lock.insert(client_id, db.clone());
+                        db
+                    }
+                    Err(e) => return Err(tonic::Status::new(tonic::Code::Internal, e.to_string())),
+                }
+            }
+        };
+
+        let description = db
+            .describe(stmt, auth, None)
+            .await
+            // TODO: this is no necessarily a permission denied error!
+            // FIXME: the double map_err looks off
+            .map_err(|e| tonic::Status::new(tonic::Code::PermissionDenied, e.to_string()))?
+            .map_err(|e| tonic::Status::new(tonic::Code::PermissionDenied, e.to_string()))?;
+
+        let param_count = description.params.len() as u64;
+        let param_names = description
+            .params
+            .into_iter()
+            .filter_map(|p| p.name)
+            .collect::<Vec<_>>();
+
+        Ok(tonic::Response::new(DescribeResult {
+            describe_result: Some(describe_result::DescribeResult::Description(Description {
+                column_descriptions: description
+                    .cols
+                    .into_iter()
+                    .map(|c| crate::rpc::proxy::rpc::Column {
+                        name: c.name,
+                        decltype: c.decltype,
+                    })
+                    .collect(),
+                param_names,
+                param_count,
+            })),
+        }))
     }
 }

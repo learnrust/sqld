@@ -2,6 +2,7 @@
 use std::{
     ffi::{c_char, c_int, c_void, CStr},
     marker::PhantomData,
+    panic::{catch_unwind, resume_unwind},
 };
 
 use crate::ffi::{libsql_wal_methods, sqlite3, sqlite3_file, sqlite3_vfs, types::*, PgHdr, Wal};
@@ -128,6 +129,7 @@ pub unsafe trait WalHook {
 init_static_wal_method!(TRANSPARENT_METHODS, TransparentMethods);
 
 /// Wal implemementation that just proxies calls to the wrapped WAL methods implementation
+#[derive(Debug)]
 pub enum TransparentMethods {}
 
 unsafe impl WalHook for TransparentMethods {
@@ -193,6 +195,32 @@ impl<T: WalHook> WalMethodsHook<T> {
     pub fn as_wal_methods_ptr(&self) -> *const libsql_wal_methods {
         self as *const _ as *mut _
     }
+}
+
+macro_rules! catch_panic {
+    ($name:literal, { $($body:tt)* }) => {
+        {
+            let ret = catch_unwind(move || {
+                $($body)*
+            });
+
+            match ret {
+                Ok(x) => x,
+                Err(e) => {
+                    let error = if let Some(s) = e.downcast_ref::<String>() {
+                        s.as_str()
+                    } else if let Some(s) = e.downcast_ref::<&str>() {
+                        s
+                    } else {
+                        "unknown"
+                    };
+                    let bt = std::backtrace::Backtrace::force_capture();
+                    tracing::error!("panic in call to {}: {error}:\n{bt}", $name);
+                    resume_unwind(e)
+                }
+            }
+        }
+    };
 }
 
 #[allow(non_snake_case)]
@@ -295,11 +323,13 @@ pub extern "C" fn xUndo<T: WalHook>(
     func: Option<unsafe extern "C" fn(*mut c_void, u32) -> i32>,
     undo_ctx: *mut c_void,
 ) -> i32 {
-    assert!(!wal.is_null());
-    let wal = unsafe { &mut *wal };
-    let orig_methods = get_orig_methods::<T>(wal);
-    let orig_xundo = orig_methods.xUndo.unwrap();
-    T::on_undo(wal, func, undo_ctx, orig_xundo)
+    catch_panic!("xUndo", {
+        assert!(!wal.is_null());
+        let wal = unsafe { &mut *wal };
+        let orig_methods = get_orig_methods::<T>(wal);
+        let orig_xundo = orig_methods.xUndo.unwrap();
+        T::on_undo(wal, func, undo_ctx, orig_xundo)
+    })
 }
 
 #[allow(non_snake_case)]
@@ -310,8 +340,12 @@ pub extern "C" fn xSavepoint<T: WalHook>(wal: *mut Wal, wal_data: *mut u32) {
 
 #[allow(non_snake_case)]
 pub extern "C" fn xSavepointUndo<T: WalHook>(wal: *mut Wal, wal_data: *mut u32) -> i32 {
-    let orig_methods = unsafe { get_orig_methods::<T>(&mut *wal) };
-    unsafe { (orig_methods.xSavepointUndo.unwrap())(wal, wal_data) }
+    catch_panic!("xSavepointUndo", {
+        let wal = unsafe { &mut *wal };
+        let orig_methods = get_orig_methods::<T>(wal);
+        let orig_xsavepointundo = orig_methods.xSavepointUndo.unwrap();
+        T::on_savepoint_undo(wal, wal_data, orig_xsavepointundo)
+    })
 }
 
 #[allow(non_snake_case)]
@@ -323,20 +357,22 @@ pub extern "C" fn xFrames<T: WalHook>(
     is_commit: c_int,
     sync_flags: c_int,
 ) -> c_int {
-    assert!(!wal.is_null());
-    let wal = unsafe { &mut *wal };
-    let orig_methods = get_orig_methods::<T>(wal);
-    let orig_xframe = orig_methods.xFrames.unwrap();
+    catch_panic!("xFrames", {
+        assert!(!wal.is_null());
+        let wal = unsafe { &mut *wal };
+        let orig_methods = get_orig_methods::<T>(wal);
+        let orig_xframe = orig_methods.xFrames.unwrap();
 
-    T::on_frames(
-        wal,
-        page_size,
-        page_headers,
-        size_after,
-        is_commit,
-        sync_flags,
-        orig_xframe,
-    )
+        T::on_frames(
+            wal,
+            page_size,
+            page_headers,
+            size_after,
+            is_commit,
+            sync_flags,
+            orig_xframe,
+        )
+    })
 }
 
 #[tracing::instrument(skip(wal, db))]
@@ -353,9 +389,11 @@ pub extern "C" fn xCheckpoint<T: WalHook>(
     frames_in_wal: *mut c_int,
     backfilled_frames: *mut c_int,
 ) -> i32 {
-    let orig_methods = unsafe { get_orig_methods::<T>(&mut *wal) };
-    unsafe {
-        (orig_methods.xCheckpoint.unwrap())(
+    catch_panic!("xCheckpoint", {
+        let wal = unsafe { &mut *wal };
+        let orig_methods = get_orig_methods::<T>(wal);
+        let orig_xcheckpoint = orig_methods.xCheckpoint.unwrap();
+        T::on_checkpoint(
             wal,
             db,
             emode,
@@ -366,8 +404,9 @@ pub extern "C" fn xCheckpoint<T: WalHook>(
             z_buf,
             frames_in_wal,
             backfilled_frames,
+            orig_xcheckpoint,
         )
-    }
+    })
 }
 
 #[allow(non_snake_case)]

@@ -7,7 +7,8 @@ use sqld_libsql_bindings::init_static_wal_method;
 use sqld_libsql_bindings::{ffi::types::XWalFrameFn, wal_hook::WalHook};
 
 use crate::replication::frame::{Frame, FrameBorrowed};
-use crate::replication::{FrameNo, WAL_PAGE_SIZE};
+use crate::replication::FrameNo;
+use crate::LIBSQL_PAGE_SIZE;
 
 use super::snapshot::TempSnapshot;
 
@@ -70,6 +71,7 @@ init_static_wal_method!(INJECTOR_METHODS, InjectorHook);
 /// The Caller must first call `set_frames`, passing the frames to be injected, then trigger a call
 /// to xFrames from the libsql connection (see dummy write in `injector`), and can then collect the
 /// result on the injection with `take_result`
+#[derive(Debug)]
 pub enum InjectorHook {}
 
 pub struct InjectorHookCtx {
@@ -81,6 +83,14 @@ pub struct InjectorHookCtx {
     pre_commit: Box<dyn Fn(FrameNo) -> anyhow::Result<()>>,
     /// invoked after injecting frames
     post_commit: Box<dyn Fn(FrameNo) -> anyhow::Result<()>>,
+}
+
+impl std::fmt::Debug for InjectorHookCtx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InjectorHookCtx")
+            .field("is_txn", &self.is_txn)
+            .finish()
+    }
 }
 
 impl InjectorHookCtx {
@@ -114,7 +124,7 @@ impl InjectorHookCtx {
         let ret = unsafe {
             orig(
                 wal,
-                WAL_PAGE_SIZE,
+                LIBSQL_PAGE_SIZE as i32,
                 page_headers.as_ptr(),
                 size_after,
                 (size_after != 0) as _,
@@ -155,6 +165,8 @@ unsafe impl WalHook for InjectorHook {
             match ctx.receiver.blocking_recv() {
                 Some(frames) => {
                     let (headers, last_frame_no, size_after) = frames.to_headers();
+
+                    tracing::trace!("applying frame {}", last_frame_no);
 
                     let ret = ctx.inject_pages(
                         headers,

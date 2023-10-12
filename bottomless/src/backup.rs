@@ -1,11 +1,12 @@
 use crate::replicator::CompressionKind;
 use crate::wal::WalFileReader;
-use anyhow::{anyhow, Result};
-use arc_swap::ArcSwap;
+use anyhow::{anyhow, bail, Result};
+use arc_swap::ArcSwapOption;
 use std::ops::Range;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc::Sender;
+use tokio::time::Instant;
 use uuid::Uuid;
 
 #[derive(Debug)]
@@ -17,14 +18,14 @@ pub(crate) struct WalCopier {
     wal_path: String,
     bucket: String,
     db_name: Arc<str>,
-    generation: Arc<ArcSwap<Uuid>>,
+    generation: Arc<ArcSwapOption<Uuid>>,
 }
 
 impl WalCopier {
     pub fn new(
         bucket: String,
         db_name: Arc<str>,
-        generation: Arc<ArcSwap<Uuid>>,
+        generation: Arc<ArcSwapOption<Uuid>>,
         db_path: &str,
         max_frames_per_batch: usize,
         use_compression: CompressionKind,
@@ -55,10 +56,14 @@ impl WalCopier {
             if let Some(wal) = self.wal.as_mut() {
                 wal
             } else {
-                return Err(anyhow!("WAL file not found: \"{:?}\"", self.wal_path));
+                return Err(anyhow!("WAL file not found: `{}`", self.wal_path));
             }
         };
-        let generation = self.generation.load_full();
+        let generation = if let Some(generation) = self.generation.load_full() {
+            generation
+        } else {
+            bail!("Generation has not been set");
+        };
         let dir = format!("{}/{}-{}", self.bucket, self.db_name, generation);
         if frames.start == 1 {
             // before writing the first batch of frames - init directory
@@ -85,6 +90,7 @@ impl WalCopier {
         tracing::trace!("Flushing {} frames locally.", frames.len());
 
         for start in frames.clone().step_by(self.max_frames_per_batch) {
+            let period_start = Instant::now();
             let timestamp = chrono::Utc::now().timestamp() as u64;
             let end = (start + self.max_frames_per_batch as u32).min(frames.end);
             let len = (end - start) as usize;
@@ -112,8 +118,9 @@ impl WalCopier {
                 }
             }
             if tracing::enabled!(tracing::Level::DEBUG) {
+                let elapsed = Instant::now() - period_start;
                 let file_len = out.metadata().await?.len();
-                tracing::debug!("written {} bytes to {}", file_len, fdesc);
+                tracing::debug!("written {} bytes to {} in {:?}", file_len, fdesc, elapsed);
             }
             drop(out);
             if self.outbox.send(fdesc).await.is_err() {

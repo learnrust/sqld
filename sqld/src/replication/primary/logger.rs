@@ -10,21 +10,23 @@ use anyhow::{bail, ensure};
 use bytemuck::{bytes_of, pod_read_unaligned, Pod, Zeroable};
 use bytes::{Bytes, BytesMut};
 use parking_lot::RwLock;
+use rusqlite::ffi::SQLITE_BUSY;
 use sqld_libsql_bindings::init_static_wal_method;
 use tokio::sync::watch;
+use tokio::time::{Duration, Instant};
 use uuid::Uuid;
 
-#[cfg(feature = "bottomless")]
-use crate::libsql::ffi::SQLITE_IOERR_WRITE;
-use crate::libsql::ffi::{
+use crate::libsql_bindings::ffi::SQLITE_IOERR_WRITE;
+use crate::libsql_bindings::ffi::{
     sqlite3,
     types::{XWalCheckpointFn, XWalFrameFn, XWalSavePointUndoFn, XWalUndoFn},
     PageHdrIter, PgHdr, Wal, SQLITE_CHECKPOINT_TRUNCATE, SQLITE_IOERR, SQLITE_OK,
 };
-use crate::libsql::wal_hook::WalHook;
+use crate::libsql_bindings::wal_hook::WalHook;
 use crate::replication::frame::{Frame, FrameHeader};
 use crate::replication::snapshot::{find_snapshot_file, LogCompactor, SnapshotFile};
-use crate::replication::{FrameNo, CRC_64_GO_ISO, WAL_MAGIC, WAL_PAGE_SIZE};
+use crate::replication::{FrameNo, SnapshotCallback, CRC_64_GO_ISO, WAL_MAGIC};
+use crate::LIBSQL_PAGE_SIZE;
 
 init_static_wal_method!(REPLICATION_METHODS, ReplicationLoggerHook);
 
@@ -40,13 +42,13 @@ impl Version {
     }
 }
 
+#[derive(Debug)]
 pub enum ReplicationLoggerHook {}
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ReplicationLoggerHookCtx {
     buffer: Vec<WalPage>,
     logger: Arc<ReplicationLogger>,
-    #[cfg(feature = "bottomless")]
     bottomless_replicator: Option<Arc<std::sync::Mutex<bottomless::replicator::Replicator>>>,
 }
 
@@ -76,14 +78,14 @@ unsafe impl WalHook for ReplicationLoggerHook {
     ) -> c_int {
         assert_eq!(page_size, 4096);
         let wal_ptr = wal as *mut _;
-        #[cfg(feature = "bottomless")]
         let last_valid_frame = wal.hdr.mxFrame;
-        #[cfg(feature = "bottomless")]
-        let _frame_checksum = wal.hdr.aFrameCksum;
+        tracing::trace!("Last valid frame before applying: {last_valid_frame}");
         let ctx = Self::wal_extract_ctx(wal);
 
+        let mut frame_count = 0;
         for (page_no, data) in PageHdrIter::new(page_headers, page_size as _) {
-            ctx.write_frame(page_no, data)
+            ctx.write_frame(page_no, data);
+            frame_count += 1;
         }
         if let Err(e) = ctx.flush(ntruncate) {
             tracing::error!("error writing to replication log: {e}");
@@ -102,35 +104,6 @@ unsafe impl WalHook for ReplicationLoggerHook {
             )
         };
 
-        // FIXME: instead of block_on, we should consider replicating asynchronously in the background,
-        // e.g. by sending the data to another fiber by an unbounded channel (which allows sync insertions).
-        #[allow(clippy::await_holding_lock)] // uncontended -> only gets called under a libSQL write lock
-        #[cfg(feature = "bottomless")]
-        if rc == 0 {
-            let runtime = tokio::runtime::Handle::current();
-            if let Some(replicator) = ctx.bottomless_replicator.as_mut() {
-                match runtime.block_on(async move {
-                    let mut replicator = replicator.lock().unwrap();
-                    replicator.register_last_valid_frame(last_valid_frame);
-                    // In theory it's enough to set the page size only once, but in practice
-                    // it's a very cheap operation anyway, and the page is not always known
-                    // upfront and can change dynamically.
-                    // FIXME: changing the page size in the middle of operation is *not*
-                    // supported by bottomless storage.
-                    replicator.set_page_size(page_size as usize)?;
-                    let frame_count = PageHdrIter::new(page_headers, page_size as usize).count();
-                    replicator.submit_frames(frame_count as u32);
-                    Ok::<(), anyhow::Error>(())
-                }) {
-                    Ok(()) => {}
-                    Err(e) => {
-                        tracing::error!("error writing to bottomless: {e}");
-                        return SQLITE_IOERR_WRITE;
-                    }
-                }
-            }
-        }
-
         if is_commit != 0 && rc == 0 {
             if let Err(e) = ctx.commit() {
                 // If we reach this point, it means that we have commited a transaction to sqlite wal,
@@ -139,6 +112,18 @@ unsafe impl WalHook for ReplicationLoggerHook {
                     "fatal error: log failed to commit: inconsistent replication log: {e}"
                 );
                 std::process::abort();
+            }
+
+            // do backup after log replication as we don't want to replicate potentially
+            // inconsistent frames
+            if let Some(replicator) = ctx.bottomless_replicator.as_mut() {
+                let mut replicator = replicator.lock().unwrap();
+                replicator.register_last_valid_frame(last_valid_frame);
+                if let Err(e) = replicator.set_page_size(page_size as usize) {
+                    tracing::error!("fatal error during backup: {e}, exiting");
+                    std::process::abort()
+                }
+                replicator.submit_frames(frame_count as u32);
             }
 
             if let Err(e) = ctx.logger.log_file.write().maybe_compact(
@@ -162,13 +147,6 @@ unsafe impl WalHook for ReplicationLoggerHook {
     ) -> i32 {
         let ctx = Self::wal_extract_ctx(wal);
         ctx.rollback();
-
-        #[cfg(feature = "bottomless")]
-        tracing::error!(
-            "fixme: implement bottomless undo for {:?}",
-            ctx.bottomless_replicator
-        );
-
         unsafe { orig(wal, func, undo_ctx) }
     }
 
@@ -178,7 +156,6 @@ unsafe impl WalHook for ReplicationLoggerHook {
             return rc;
         };
 
-        #[cfg(feature = "bottomless")]
         {
             let ctx = Self::wal_extract_ctx(wal);
             if let Some(replicator) = ctx.bottomless_replicator.as_mut() {
@@ -209,7 +186,6 @@ unsafe impl WalHook for ReplicationLoggerHook {
         backfilled_frames: *mut i32,
         orig: XWalCheckpointFn,
     ) -> i32 {
-        #[cfg(feature = "bottomless")]
         {
             tracing::trace!("bottomless checkpoint");
 
@@ -221,8 +197,46 @@ unsafe impl WalHook for ReplicationLoggerHook {
              ** checkpoint attempts weaker than TRUNCATE are ignored.
              */
             if emode < SQLITE_CHECKPOINT_TRUNCATE {
-                tracing::trace!("Ignoring a checkpoint request weaker than TRUNCATE");
-                return SQLITE_OK;
+                tracing::trace!(
+                    "Ignoring a checkpoint request weaker than TRUNCATE: {}",
+                    emode
+                );
+                // Return an error to signal to sqlite that the WAL was not checkpointed, and it is
+                // therefore not safe to delete it.
+                return SQLITE_BUSY;
+            }
+        }
+
+        #[allow(clippy::await_holding_lock)]
+        // uncontended -> only gets called under a libSQL write lock
+        {
+            let ctx = Self::wal_extract_ctx(wal);
+            let runtime = tokio::runtime::Handle::current();
+            if let Some(replicator) = ctx.bottomless_replicator.as_mut() {
+                let mut replicator = replicator.lock().unwrap();
+                let last_known_frame = replicator.last_known_frame();
+                replicator.request_flush();
+                if last_known_frame == 0 {
+                    tracing::debug!("No comitted changes in this generation, not snapshotting");
+                    replicator.skip_snapshot_for_current_generation();
+                    return SQLITE_OK;
+                }
+                if let Err(e) = runtime.block_on(replicator.wait_until_committed(last_known_frame))
+                {
+                    tracing::error!(
+                        "Failed to wait for S3 replicator to confirm {} frames backup: {}",
+                        last_known_frame,
+                        e
+                    );
+                    return SQLITE_IOERR_WRITE;
+                }
+                if let Err(e) = runtime.block_on(replicator.wait_until_snapshotted()) {
+                    tracing::error!(
+                        "Failed to wait for S3 replicator to confirm database snapshot backup: {}",
+                        e
+                    );
+                    return SQLITE_IOERR_WRITE;
+                }
             }
         }
         let rc = unsafe {
@@ -244,29 +258,14 @@ unsafe impl WalHook for ReplicationLoggerHook {
             return rc;
         }
 
-        #[allow(clippy::await_holding_lock)] // uncontended -> only gets called under a libSQL write lock
-        #[cfg(feature = "bottomless")]
+        #[allow(clippy::await_holding_lock)]
+        // uncontended -> only gets called under a libSQL write lock
         {
             let ctx = Self::wal_extract_ctx(wal);
             let runtime = tokio::runtime::Handle::current();
             if let Some(replicator) = ctx.bottomless_replicator.as_mut() {
                 let mut replicator = replicator.lock().unwrap();
-                if replicator.commits_in_current_generation() == 0 {
-                    tracing::debug!("No commits happened in this generation, not snapshotting");
-                    return SQLITE_OK;
-                }
-                let last_known_frame = replicator.last_known_frame();
-                replicator.request_flush();
-                if let Err(e) = runtime.block_on(replicator.wait_until_committed(last_known_frame))
-                {
-                    tracing::error!(
-                        "Failed to wait for S3 replicator to confirm {} frames backup: {}",
-                        last_known_frame,
-                        e
-                    );
-                    return SQLITE_IOERR_WRITE;
-                }
-                replicator.new_generation();
+                let _prev = replicator.new_generation();
                 if let Err(e) =
                     runtime.block_on(async move { replicator.snapshot_main_db_file().await })
                 {
@@ -279,7 +278,7 @@ unsafe impl WalHook for ReplicationLoggerHook {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct WalPage {
     pub page_no: u32,
     /// 0 for non-commit frames
@@ -290,16 +289,14 @@ pub struct WalPage {
 impl ReplicationLoggerHookCtx {
     pub fn new(
         logger: Arc<ReplicationLogger>,
-        #[cfg(feature = "bottomless")] bottomless_replicator: Option<
-            Arc<std::sync::Mutex<bottomless::replicator::Replicator>>,
-        >,
+        bottomless_replicator: Option<Arc<std::sync::Mutex<bottomless::replicator::Replicator>>>,
     ) -> Self {
-        #[cfg(feature = "bottomless")]
-        tracing::trace!("bottomless replication enabled: {bottomless_replicator:?}");
+        if bottomless_replicator.is_some() {
+            tracing::trace!("bottomless replication enabled");
+        }
         Self {
             buffer: Default::default(),
             logger,
-            #[cfg(feature = "bottomless")]
             bottomless_replicator,
         }
     }
@@ -326,13 +323,18 @@ impl ReplicationLoggerHookCtx {
 
     fn commit(&self) -> anyhow::Result<()> {
         let new_frame_no = self.logger.commit()?;
-        let _ = self.logger.new_frame_notifier.send(new_frame_no);
+        tracing::trace!("new frame commited {new_frame_no:?}");
+        self.logger.new_frame_notifier.send_replace(new_frame_no);
         Ok(())
     }
 
     fn rollback(&mut self) {
         self.logger.log_file.write().rollback();
         self.buffer.clear();
+    }
+
+    pub fn logger(&self) -> &ReplicationLogger {
+        self.logger.as_ref()
     }
 }
 
@@ -345,6 +347,11 @@ pub struct LogFile {
     pub header: LogFileHeader,
     /// the maximum number of frames this log is allowed to contain before it should be compacted.
     max_log_frame_count: u64,
+    /// the maximum duration before the log should be compacted.
+    max_log_duration: Option<Duration>,
+    /// the time of the last compaction
+    last_compact_instant: Instant,
+
     /// number of frames in the log that have not been commited yet. On commit the header's frame
     /// count is incremented by that ammount. New pages are written after the last
     /// header.frame_count + uncommit_frame_count.
@@ -369,62 +376,58 @@ pub enum LogReadError {
 
 impl LogFile {
     /// size of a single frame
-    pub const FRAME_SIZE: usize = size_of::<FrameHeader>() + WAL_PAGE_SIZE as usize;
+    pub const FRAME_SIZE: usize = size_of::<FrameHeader>() + LIBSQL_PAGE_SIZE as usize;
 
-    pub fn new(file: File, max_log_frame_count: u64) -> anyhow::Result<Self> {
+    pub fn new(
+        file: File,
+        max_log_frame_count: u64,
+        max_log_duration: Option<Duration>,
+    ) -> anyhow::Result<Self> {
         // FIXME: we should probably take a lock on this file, to prevent anybody else to write to
         // it.
         let file_end = file.metadata()?.len();
 
-        if file_end == 0 {
+        let header = if file_end == 0 {
             let db_id = Uuid::new_v4();
-            let header = LogFileHeader {
+            LogFileHeader {
                 version: 2,
                 start_frame_no: 0,
                 magic: WAL_MAGIC,
-                page_size: WAL_PAGE_SIZE,
+                page_size: LIBSQL_PAGE_SIZE as i32,
                 start_checksum: 0,
                 db_id: db_id.as_u128(),
                 frame_count: 0,
                 sqld_version: Version::current().0,
-            };
-
-            let mut this = Self {
-                file,
-                header,
-                max_log_frame_count,
-                uncommitted_frame_count: 0,
-                uncommitted_checksum: 0,
-                commited_checksum: 0,
-            };
-
-            this.write_header()?;
-
-            Ok(this)
-        } else {
-            let header = Self::read_header(&file)?;
-            let mut this = Self {
-                file,
-                header,
-                max_log_frame_count,
-                uncommitted_frame_count: 0,
-                uncommitted_checksum: 0,
-                commited_checksum: 0,
-            };
-
-            if let Some(last_commited) = this.last_commited_frame_no() {
-                // file is not empty, the starting checksum is the checksum from the last entry
-                let last_frame = this.frame(last_commited)?;
-                this.commited_checksum = last_frame.header().checksum;
-                this.uncommitted_checksum = last_frame.header().checksum;
-            } else {
-                // file contains no entry, start with the initial checksum from the file header.
-                this.commited_checksum = this.header.start_checksum;
-                this.uncommitted_checksum = this.header.start_checksum;
             }
+        } else {
+            Self::read_header(&file)?
+        };
 
-            Ok(this)
+        let mut this = Self {
+            file,
+            header,
+            max_log_frame_count,
+            max_log_duration,
+            last_compact_instant: Instant::now(),
+            uncommitted_frame_count: 0,
+            uncommitted_checksum: 0,
+            commited_checksum: 0,
+        };
+
+        if file_end == 0 {
+            this.write_header()?;
+        } else if let Some(last_commited) = this.last_commited_frame_no() {
+            // file is not empty, the starting checksum is the checksum from the last entry
+            let last_frame = this.frame(last_commited)?;
+            this.commited_checksum = last_frame.header().checksum;
+            this.uncommitted_checksum = last_frame.header().checksum;
+        } else {
+            // file contains no entry, start with the initial checksum from the file header.
+            this.commited_checksum = this.header.start_checksum;
+            this.uncommitted_checksum = this.header.start_checksum;
         }
+
+        Ok(this)
     }
 
     pub fn read_header(file: &File) -> anyhow::Result<LogFileHeader> {
@@ -566,25 +569,43 @@ impl LogFile {
         Ok(frame)
     }
 
+    fn should_compact(&self) -> bool {
+        let mut compact = false;
+        compact |= self.header.frame_count > self.max_log_frame_count;
+        if let Some(max_log_duration) = self.max_log_duration {
+            compact |= self.last_compact_instant.elapsed() > max_log_duration;
+        }
+        compact &= self.uncommitted_frame_count == 0;
+        compact
+    }
+
     fn maybe_compact(
         &mut self,
         compactor: LogCompactor,
         size_after: u32,
         path: &Path,
     ) -> anyhow::Result<()> {
-        if self.header.frame_count > self.max_log_frame_count {
-            return self.do_compaction(compactor, size_after, path);
+        if self.should_compact() {
+            self.do_compaction(compactor, size_after, path)
+        } else {
+            Ok(())
         }
-
-        Ok(())
     }
 
+    /// perform the log compaction.
     fn do_compaction(
         &mut self,
         compactor: LogCompactor,
         size_after: u32,
         path: &Path,
     ) -> anyhow::Result<()> {
+        assert_eq!(self.uncommitted_frame_count, 0);
+
+        // nothing to compact
+        if self.header().frame_count == 0 {
+            return Ok(());
+        }
+
         tracing::info!("performing log compaction");
         let temp_log_path = path.join("temp_log");
         let file = OpenOptions::new()
@@ -592,9 +613,9 @@ impl LogFile {
             .write(true)
             .create(true)
             .open(&temp_log_path)?;
-        let mut new_log_file = LogFile::new(file, self.max_log_frame_count)?;
+        let mut new_log_file = LogFile::new(file, self.max_log_frame_count, self.max_log_duration)?;
         let new_header = LogFileHeader {
-            start_frame_no: self.header.start_frame_no + self.header.frame_count,
+            start_frame_no: self.header.last_frame_no().unwrap() + 1,
             frame_count: 0,
             start_checksum: self.commited_checksum,
             ..self.header
@@ -627,9 +648,10 @@ impl LogFile {
 
     fn reset(self) -> anyhow::Result<Self> {
         let max_log_frame_count = self.max_log_frame_count;
+        let max_log_duration = self.max_log_duration;
         // truncate file
         self.file.set_len(0)?;
-        Self::new(self.file, max_log_frame_count)
+        Self::new(self.file, max_log_frame_count, max_log_duration)
     }
 }
 
@@ -697,8 +719,13 @@ pub struct LogFileHeader {
 }
 
 impl LogFileHeader {
-    pub fn last_frame_no(&self) -> FrameNo {
-        self.start_frame_no + self.frame_count
+    pub fn last_frame_no(&self) -> Option<FrameNo> {
+        if self.start_frame_no == 0 && self.frame_count == 0 {
+            // The log does not contain any frame yet
+            None
+        } else {
+            Some(self.start_frame_no + self.frame_count - 1)
+        }
     }
 
     fn sqld_version(&self) -> Version {
@@ -706,6 +733,7 @@ impl LogFileHeader {
     }
 }
 
+#[derive(Debug)]
 pub struct Generation {
     pub id: Uuid,
     pub start_index: u64,
@@ -720,6 +748,7 @@ impl Generation {
     }
 }
 
+#[derive(Debug)]
 pub struct ReplicationLogger {
     pub generation: Generation,
     pub log_file: RwLock<LogFile>,
@@ -727,11 +756,20 @@ pub struct ReplicationLogger {
     db_path: PathBuf,
     /// a notifier channel other tasks can subscribe to, and get notified when new frames become
     /// available.
-    pub new_frame_notifier: watch::Sender<FrameNo>,
+    pub new_frame_notifier: watch::Sender<Option<FrameNo>>,
+    pub closed_signal: watch::Sender<bool>,
+    pub auto_checkpoint: u32,
 }
 
 impl ReplicationLogger {
-    pub fn open(db_path: &Path, max_log_size: u64, dirty: bool) -> anyhow::Result<Self> {
+    pub fn open(
+        db_path: &Path,
+        max_log_size: u64,
+        max_log_duration: Option<Duration>,
+        dirty: bool,
+        auto_checkpoint: u32,
+        callback: SnapshotCallback,
+    ) -> anyhow::Result<Self> {
         let log_path = db_path.join("wallog");
         let data_path = db_path.join("data");
 
@@ -744,7 +782,7 @@ impl ReplicationLogger {
             .open(log_path)?;
 
         let max_log_frame_count = max_log_size * 1_000_000 / LogFile::FRAME_SIZE as u64;
-        let log_file = LogFile::new(file, max_log_frame_count)?;
+        let log_file = LogFile::new(file, max_log_frame_count, max_log_duration)?;
         let header = log_file.header();
 
         let should_recover = if dirty {
@@ -761,28 +799,55 @@ impl ReplicationLogger {
         };
 
         if should_recover {
-            Self::recover(log_file, data_path)
+            Self::recover(log_file, data_path, callback, auto_checkpoint)
         } else {
-            Self::from_log_file(db_path.to_path_buf(), log_file)
+            Self::from_log_file(db_path.to_path_buf(), log_file, callback, auto_checkpoint)
         }
     }
 
-    fn from_log_file(db_path: PathBuf, log_file: LogFile) -> anyhow::Result<Self> {
+    fn from_log_file(
+        db_path: PathBuf,
+        log_file: LogFile,
+        callback: SnapshotCallback,
+        auto_checkpoint: u32,
+    ) -> anyhow::Result<Self> {
         let header = log_file.header();
-        let generation_start_frame_no = header.start_frame_no + header.frame_count;
+        let generation_start_frame_no = header.last_frame_no();
 
         let (new_frame_notifier, _) = watch::channel(generation_start_frame_no);
+        unsafe {
+            let conn = rusqlite::Connection::open(db_path.join("data"))?;
+            let rc = rusqlite::ffi::sqlite3_wal_autocheckpoint(conn.handle(), auto_checkpoint as _);
+            if rc != 0 {
+                bail!(
+                    "Failed to set WAL autocheckpoint to {} - error code: {}",
+                    auto_checkpoint,
+                    rc
+                )
+            } else {
+                tracing::info!("SQLite autocheckpoint: {}", auto_checkpoint);
+            }
+        }
+
+        let (closed_signal, _) = watch::channel(false);
 
         Ok(Self {
-            generation: Generation::new(generation_start_frame_no),
-            compactor: LogCompactor::new(&db_path, log_file.header.db_id)?,
+            generation: Generation::new(generation_start_frame_no.unwrap_or(0)),
+            compactor: LogCompactor::new(&db_path, log_file.header.db_id, callback)?,
             log_file: RwLock::new(log_file),
             db_path,
+            closed_signal,
             new_frame_notifier,
+            auto_checkpoint,
         })
     }
 
-    fn recover(log_file: LogFile, mut data_path: PathBuf) -> anyhow::Result<Self> {
+    fn recover(
+        log_file: LogFile,
+        mut data_path: PathBuf,
+        callback: SnapshotCallback,
+        auto_checkpoint: u32,
+    ) -> anyhow::Result<Self> {
         // It is necessary to checkpoint before we restore the replication log, since the WAL may
         // contain pages that are not in the database file.
         checkpoint_db(&data_path)?;
@@ -794,14 +859,14 @@ impl ReplicationLogger {
         let data_file = File::open(&data_path)?;
         let size = data_path.metadata()?.len();
         assert!(
-            size % WAL_PAGE_SIZE as u64 == 0,
+            size % LIBSQL_PAGE_SIZE == 0,
             "database file size is not a multiple of page size"
         );
-        let num_page = size / WAL_PAGE_SIZE as u64;
-        let mut buf = [0; WAL_PAGE_SIZE as usize];
+        let num_page = size / LIBSQL_PAGE_SIZE;
+        let mut buf = [0; LIBSQL_PAGE_SIZE as usize];
         let mut page_no = 1; // page numbering starts at 1
         for i in 0..num_page {
-            data_file.read_exact_at(&mut buf, i * WAL_PAGE_SIZE as u64)?;
+            data_file.read_exact_at(&mut buf, i * LIBSQL_PAGE_SIZE)?;
             log_file.push_page(&WalPage {
                 page_no,
                 size_after: if i == num_page - 1 { num_page as _ } else { 0 },
@@ -814,7 +879,7 @@ impl ReplicationLogger {
 
         assert!(data_path.pop());
 
-        Self::from_log_file(data_path, log_file)
+        Self::from_log_file(data_path, log_file, callback, auto_checkpoint)
     }
 
     pub fn database_id(&self) -> anyhow::Result<Uuid> {
@@ -850,7 +915,7 @@ impl ReplicationLogger {
     }
 
     /// commit the current transaction and returns the new top frame number
-    fn commit(&self) -> anyhow::Result<FrameNo> {
+    fn commit(&self) -> anyhow::Result<Option<FrameNo>> {
         let mut log_file = self.log_file.write();
         log_file.commit()?;
         Ok(log_file.header().last_frame_no())
@@ -863,17 +928,59 @@ impl ReplicationLogger {
     pub fn get_frame(&self, frame_no: FrameNo) -> Result<Frame, LogReadError> {
         self.log_file.read().frame(frame_no)
     }
+
+    pub fn maybe_compact(&self) -> anyhow::Result<bool> {
+        let mut log_file = self.log_file.write();
+        if !log_file.should_compact() {
+            // compaction is not necessary or impossible, so exit early
+            return Ok(false);
+        }
+
+        let last_frame = {
+            let mut frames_iter = log_file.rev_frames_iter()?;
+            let Some(last_frame_res) = frames_iter.next() else {
+                // the log file is empty, nothing to compact
+                return Ok(false);
+            };
+            last_frame_res?
+        };
+
+        let size_after = last_frame.header().size_after;
+        assert!(size_after != 0);
+
+        log_file.do_compaction(self.compactor.clone(), size_after, &self.db_path)?;
+        Ok(true)
+    }
 }
 
-fn checkpoint_db(data_path: &Path) -> anyhow::Result<()> {
+// FIXME: calling rusqlite::Connection's checkpoint here is a bug,
+// we need to always call our virtual WAL methods.
+pub fn checkpoint_db(data_path: &Path) -> anyhow::Result<()> {
+    let wal_path = match data_path.parent() {
+        Some(path) => path.join("data-wal"),
+        None => return Ok(()),
+    };
+
+    if wal_path.try_exists()? {
+        if File::open(wal_path)?.metadata()?.len() == 0 {
+            tracing::debug!("wal file is empty, checkpoint not necessary");
+            return Ok(());
+        }
+    } else {
+        tracing::debug!("wal file doesn't exist, checkpoint not necessary");
+        return Ok(());
+    }
+
     unsafe {
         let conn = rusqlite::Connection::open(data_path)?;
+        conn.query_row("PRAGMA journal_mode=WAL", (), |_| Ok(()))?;
+        tracing::info!("initialized journal_mode=WAL");
         conn.pragma_query(None, "page_size", |row| {
             let page_size = row.get::<_, i32>(0).unwrap();
             assert_eq!(
-                page_size, WAL_PAGE_SIZE,
+                page_size, LIBSQL_PAGE_SIZE as i32,
                 "invalid database file, expected page size to be {}, but found {} instead",
-                WAL_PAGE_SIZE, page_size
+                LIBSQL_PAGE_SIZE, page_size
             );
             Ok(())
         })?;
@@ -885,27 +992,35 @@ fn checkpoint_db(data_path: &Path) -> anyhow::Result<()> {
             &mut num_checkpointed as *mut _,
             std::ptr::null_mut(),
         );
-
-        // TODO: ensure correct page size
-        ensure!(
-            rc == 0 && num_checkpointed >= 0,
-            "failed to checkpoint database while recovering replication log"
-        );
-
-        conn.execute("VACUUM", ())?;
+        if rc == 0 {
+            if num_checkpointed == -1 {
+                bail!("Checkpoint failed: database journal_mode is not WAL")
+            } else {
+                Ok(())
+            }
+        } else {
+            bail!("Checkpoint failed: wal_checkpoint_v2 error code {}", rc)
+        }
     }
-
-    Ok(())
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::DEFAULT_AUTO_CHECKPOINT;
 
     #[test]
     fn write_and_read_from_frame_log() {
         let dir = tempfile::tempdir().unwrap();
-        let logger = ReplicationLogger::open(dir.path(), 0, false).unwrap();
+        let logger = ReplicationLogger::open(
+            dir.path(),
+            0,
+            None,
+            false,
+            DEFAULT_AUTO_CHECKPOINT,
+            Box::new(|_| Ok(())),
+        )
+        .unwrap();
 
         let frames = (0..10)
             .map(|i| WalPage {
@@ -933,7 +1048,15 @@ mod test {
     #[test]
     fn index_out_of_bounds() {
         let dir = tempfile::tempdir().unwrap();
-        let logger = ReplicationLogger::open(dir.path(), 0, false).unwrap();
+        let logger = ReplicationLogger::open(
+            dir.path(),
+            0,
+            None,
+            false,
+            DEFAULT_AUTO_CHECKPOINT,
+            Box::new(|_| Ok(())),
+        )
+        .unwrap();
         let log_file = logger.log_file.write();
         assert!(matches!(log_file.frame(1), Err(LogReadError::Ahead)));
     }
@@ -942,7 +1065,15 @@ mod test {
     #[should_panic]
     fn incorrect_frame_size() {
         let dir = tempfile::tempdir().unwrap();
-        let logger = ReplicationLogger::open(dir.path(), 0, false).unwrap();
+        let logger = ReplicationLogger::open(
+            dir.path(),
+            0,
+            None,
+            false,
+            DEFAULT_AUTO_CHECKPOINT,
+            Box::new(|_| Ok(())),
+        )
+        .unwrap();
         let entry = WalPage {
             page_no: 0,
             size_after: 0,
@@ -956,7 +1087,7 @@ mod test {
     #[test]
     fn log_file_test_rollback() {
         let f = tempfile::tempfile().unwrap();
-        let mut log_file = LogFile::new(f, 100).unwrap();
+        let mut log_file = LogFile::new(f, 100, None).unwrap();
         (0..5)
             .map(|i| WalPage {
                 page_no: i,

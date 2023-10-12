@@ -4,12 +4,14 @@ use std::collections::HashMap;
 use super::result_builder::SingleStatementBuilder;
 use super::{proto, ProtocolError, Version};
 use crate::auth::Authenticated;
-use crate::database::{Database, DescribeResponse};
+use crate::connection::program::DescribeResponse;
+use crate::connection::Connection;
 use crate::error::Error as SqldError;
 use crate::hrana;
 use crate::query::{Params, Query, Value};
 use crate::query_analysis::Statement;
-use crate::query_result_builder::QueryResultBuilder;
+use crate::query_result_builder::{QueryResultBuilder, QueryResultBuilderError};
+use crate::replication::FrameNo;
 
 /// An error during execution of an SQL statement.
 #[derive(thiserror::Error, Debug)]
@@ -43,29 +45,33 @@ pub enum StmtError {
 
     #[error("Operation was blocked{}", .reason.as_ref().map(|msg| format!(": {}", msg)).unwrap_or_default())]
     Blocked { reason: Option<String> },
+    #[error("Response is too large")]
+    ResponseTooLarge,
+    #[error("error executing a request on the primary: {0}")]
+    Proxy(String),
 }
 
 pub async fn execute_stmt(
-    db: &impl Database,
+    db: &impl Connection,
     auth: Authenticated,
     query: Query,
+    replication_index: Option<FrameNo>,
 ) -> Result<proto::StmtResult> {
     let builder = SingleStatementBuilder::default();
-    let (stmt_res, _) = db.execute_batch(vec![query], auth, builder).await?;
-    stmt_res
-        .into_ret()
-        .map_err(|sqld_error| match stmt_error_from_sqld_error(sqld_error) {
-            Ok(stmt_error) => anyhow!(stmt_error),
-            Err(sqld_error) => anyhow!(sqld_error),
-        })
+    let (stmt_res, _) = db
+        .execute_batch(vec![query], auth, builder, replication_index)
+        .await
+        .map_err(catch_stmt_error)?;
+    stmt_res.into_ret().map_err(catch_stmt_error)
 }
 
 pub async fn describe_stmt(
-    db: &impl Database,
+    db: &impl Connection,
     auth: Authenticated,
     sql: String,
+    replication_index: Option<FrameNo>,
 ) -> Result<proto::DescribeResult> {
-    match db.describe(sql, auth).await? {
+    match db.describe(sql, auth, replication_index).await? {
         Ok(describe_response) => Ok(proto_describe_result_from_describe_response(
             describe_response,
         )),
@@ -95,14 +101,20 @@ pub fn proto_stmt_to_query(
     }
 
     let params = if proto_stmt.named_args.is_empty() {
-        let values = proto_stmt.args.iter().map(proto_value_to_value).collect();
+        let values = proto_stmt
+            .args
+            .iter()
+            .map(proto_value_to_value)
+            .collect::<Result<Vec<_>, _>>()?;
         Params::Positional(values)
     } else if proto_stmt.args.is_empty() {
         let values = proto_stmt
             .named_args
             .iter()
-            .map(|arg| (arg.name.clone(), proto_value_to_value(&arg.value)))
-            .collect();
+            .map(|arg| {
+                proto_value_to_value(&arg.value).map(|arg_value| (arg.name.clone(), arg_value))
+            })
+            .collect::<Result<HashMap<_, _>, _>>()?;
         Params::Named(values)
     } else {
         bail!(StmtError::ArgsBothPositionalAndNamed)
@@ -140,14 +152,15 @@ pub fn proto_sql_to_sql<'s>(
     }
 }
 
-fn proto_value_to_value(proto_value: &proto::Value) -> Value {
-    match proto_value {
+fn proto_value_to_value(proto_value: &proto::Value) -> Result<Value, ProtocolError> {
+    Ok(match proto_value {
+        proto::Value::None => return Err(ProtocolError::NoneValue),
         proto::Value::Null => Value::Null,
         proto::Value::Integer { value } => Value::Integer(*value),
         proto::Value::Float { value } => Value::Real(*value),
         proto::Value::Text { value } => Value::Text(value.as_ref().into()),
         proto::Value::Blob { value } => Value::Blob(value.as_ref().into()),
-    }
+    })
 }
 
 fn proto_value_from_value(value: Value) -> proto::Value {
@@ -186,12 +199,23 @@ fn proto_describe_result_from_describe_response(
     }
 }
 
+fn catch_stmt_error(sqld_error: SqldError) -> anyhow::Error {
+    match stmt_error_from_sqld_error(sqld_error) {
+        Ok(stmt_error) => anyhow!(stmt_error),
+        Err(sqld_error) => anyhow!(sqld_error),
+    }
+}
+
 pub fn stmt_error_from_sqld_error(sqld_error: SqldError) -> Result<StmtError, SqldError> {
     Ok(match sqld_error {
         SqldError::LibSqlInvalidQueryParams(source) => StmtError::ArgsInvalid { source },
         SqldError::LibSqlTxTimeout => StmtError::TransactionTimeout,
         SqldError::LibSqlTxBusy => StmtError::TransactionBusy,
+        SqldError::BuilderError(QueryResultBuilderError::ResponseTooLarge(_)) => {
+            StmtError::ResponseTooLarge
+        }
         SqldError::Blocked(reason) => StmtError::Blocked { reason },
+        SqldError::RpcQueryError(e) => StmtError::Proxy(e.message),
         SqldError::RusqliteError(rusqlite_error) => match rusqlite_error {
             rusqlite::Error::SqliteFailure(sqlite_error, Some(message)) => StmtError::SqliteError {
                 source: sqlite_error,
@@ -218,7 +242,7 @@ pub fn stmt_error_from_sqld_error(sqld_error: SqldError) -> Result<StmtError, Sq
 }
 
 pub fn proto_error_from_stmt_error(error: &StmtError) -> hrana::proto::Error {
-    hrana::proto::Error {
+    proto::Error {
         message: error.to_string(),
         code: error.code().into(),
     }
@@ -237,6 +261,8 @@ impl StmtError {
             Self::SqliteError { source, .. } => sqlite_error_code(source.code),
             Self::SqlInputError { .. } => "SQL_INPUT_ERROR",
             Self::Blocked { .. } => "BLOCKED",
+            Self::ResponseTooLarge => "RESPONSE_TOO_LARGE",
+            Self::Proxy(_) => "PROXY_ERROR",
         }
     }
 }
@@ -268,12 +294,6 @@ fn sqlite_error_code(code: rusqlite::ffi::ErrorCode) -> &'static str {
         rusqlite::ErrorCode::NotADatabase => "SQLITE_NOTADB",
         rusqlite::ErrorCode::Unknown => "SQLITE_UNKNOWN",
         _ => "SQLITE_UNKNOWN",
-    }
-}
-
-impl From<&proto::Value> for Value {
-    fn from(proto_value: &proto::Value) -> Value {
-        proto_value_to_value(proto_value)
     }
 }
 

@@ -6,6 +6,11 @@ use bytesize::ByteSize;
 use rusqlite::types::ValueRef;
 use serde::Serialize;
 use serde_json::ser::Formatter;
+use std::sync::atomic::AtomicUsize;
+
+use crate::replication::FrameNo;
+
+pub static TOTAL_RESPONSE_SIZE: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug)]
 pub enum QueryResultBuilderError {
@@ -79,6 +84,8 @@ impl<'a> From<&'a rusqlite::Column<'a>> for Column<'a> {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct QueryBuilderConfig {
     pub max_size: Option<u64>,
+    pub max_total_size: Option<u64>,
+    pub auto_checkpoint: u32,
 }
 
 pub trait QueryResultBuilder: Send + 'static {
@@ -113,7 +120,7 @@ pub trait QueryResultBuilder: Send + 'static {
     /// end adding rows
     fn finish_rows(&mut self) -> Result<(), QueryResultBuilderError>;
     /// finish serialization.
-    fn finish(&mut self) -> Result<(), QueryResultBuilderError>;
+    fn finish(&mut self, last_frame_no: Option<FrameNo>) -> Result<(), QueryResultBuilderError>;
     /// returns the inner ret
     fn into_ret(self) -> Self::Ret;
     /// Returns a `QueryResultBuilder` that wraps Self and takes at most `n` steps
@@ -304,7 +311,7 @@ impl QueryResultBuilder for StepResultsBuilder {
         Ok(())
     }
 
-    fn finish(&mut self) -> Result<(), QueryResultBuilderError> {
+    fn finish(&mut self, _last_frame_no: Option<FrameNo>) -> Result<(), QueryResultBuilderError> {
         Ok(())
     }
 
@@ -365,7 +372,7 @@ impl QueryResultBuilder for IgnoreResult {
         Ok(())
     }
 
-    fn finish(&mut self) -> Result<(), QueryResultBuilderError> {
+    fn finish(&mut self, _last_frame_no: Option<FrameNo>) -> Result<(), QueryResultBuilderError> {
         Ok(())
     }
 
@@ -474,8 +481,8 @@ impl<B: QueryResultBuilder> QueryResultBuilder for Take<B> {
         }
     }
 
-    fn finish(&mut self) -> Result<(), QueryResultBuilderError> {
-        self.inner.finish()
+    fn finish(&mut self, last_frame_no: Option<FrameNo>) -> Result<(), QueryResultBuilderError> {
+        self.inner.finish(last_frame_no)
     }
 
     fn into_ret(self) -> Self::Ret {
@@ -496,7 +503,110 @@ pub mod test {
     };
     use FsmState::*;
 
+    use crate::query::Value;
+
     use super::*;
+
+    #[derive(Default)]
+    pub struct TestBuilder {
+        steps: Vec<StepResult>,
+        current_step: StepResultBuilder,
+    }
+
+    pub type Row = Vec<Value>;
+    pub type StepResult = crate::Result<Vec<Row>>;
+
+    #[derive(Default)]
+    pub struct StepResultBuilder {
+        rows: Vec<Row>,
+        current_row: Row,
+        err: Option<crate::Error>,
+    }
+
+    impl QueryResultBuilder for TestBuilder {
+        type Ret = Vec<StepResult>;
+
+        fn init(&mut self, _config: &QueryBuilderConfig) -> Result<(), QueryResultBuilderError> {
+            self.steps.clear();
+            self.current_step = Default::default();
+            Ok(())
+        }
+
+        fn begin_step(&mut self) -> Result<(), QueryResultBuilderError> {
+            Ok(())
+        }
+
+        fn finish_step(
+            &mut self,
+            _affected_row_count: u64,
+            _last_insert_rowid: Option<i64>,
+        ) -> Result<(), QueryResultBuilderError> {
+            let current = std::mem::take(&mut self.current_step);
+            if let Some(err) = current.err {
+                self.steps.push(Err(err));
+            } else {
+                self.steps.push(Ok(current.rows));
+            }
+
+            Ok(())
+        }
+
+        fn step_error(
+            &mut self,
+            error: crate::error::Error,
+        ) -> Result<(), QueryResultBuilderError> {
+            self.current_step.err = Some(error);
+            Ok(())
+        }
+
+        fn cols_description<'a>(
+            &mut self,
+            _cols: impl IntoIterator<Item = impl Into<Column<'a>>>,
+        ) -> Result<(), QueryResultBuilderError> {
+            Ok(())
+        }
+
+        fn begin_rows(&mut self) -> Result<(), QueryResultBuilderError> {
+            Ok(())
+        }
+
+        fn begin_row(&mut self) -> Result<(), QueryResultBuilderError> {
+            Ok(())
+        }
+
+        fn add_row_value(&mut self, v: ValueRef) -> Result<(), QueryResultBuilderError> {
+            let v = match v {
+                ValueRef::Null => Value::Null,
+                ValueRef::Integer(i) => Value::Integer(i),
+                ValueRef::Real(x) => Value::Real(x),
+                ValueRef::Text(s) => Value::Text(String::from_utf8(s.to_vec()).unwrap()),
+                ValueRef::Blob(x) => Value::Blob(x.to_vec()),
+            };
+            self.current_step.current_row.push(v);
+            Ok(())
+        }
+
+        fn finish_row(&mut self) -> Result<(), QueryResultBuilderError> {
+            let row = std::mem::take(&mut self.current_step.current_row);
+            self.current_step.rows.push(row);
+            Ok(())
+        }
+
+        fn finish_rows(&mut self) -> Result<(), QueryResultBuilderError> {
+            Ok(())
+        }
+
+        fn finish(
+            &mut self,
+            _last_frame_no: Option<FrameNo>,
+        ) -> Result<(), QueryResultBuilderError> {
+            Ok(())
+        }
+
+        fn into_ret(self) -> Self::Ret {
+            self.steps
+        }
+    }
 
     /// a dummy QueryResultBuilder that encodes the QueryResultBuilder FSM. It can be passed to a
     /// driver to ensure that it is not mis-used
@@ -624,7 +734,7 @@ pub mod test {
                 FinishRow => b.finish_row().unwrap(),
                 FinishRows => b.finish_rows().unwrap(),
                 Finish => {
-                    b.finish().unwrap();
+                    b.finish(Some(0)).unwrap();
                     break;
                 }
                 BuilderError => return b,
@@ -769,7 +879,10 @@ pub mod test {
             self.transition(FinishRows)
         }
 
-        fn finish(&mut self) -> Result<(), QueryResultBuilderError> {
+        fn finish(
+            &mut self,
+            _last_frame_no: Option<FrameNo>,
+        ) -> Result<(), QueryResultBuilderError> {
             self.maybe_inject_error()?;
             self.transition(Finish)
         }
@@ -817,7 +930,7 @@ pub mod test {
         builder.finish_rows().unwrap();
         builder.finish_step(0, None).unwrap();
 
-        builder.finish().unwrap();
+        builder.finish(Some(0)).unwrap();
     }
 
     #[test]

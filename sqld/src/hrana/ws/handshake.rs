@@ -3,26 +3,55 @@ use futures::{SinkExt as _, StreamExt as _};
 use tokio_tungstenite::tungstenite;
 use tungstenite::http;
 
-use super::super::Version;
+use crate::http::user::db_factory::namespace_from_headers;
+use crate::namespace::NamespaceName;
+use crate::net::Conn;
+
+use super::super::{Encoding, Version};
 use super::Upgrade;
 
-#[derive(Debug)]
 pub enum WebSocket {
-    Tcp(tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>),
+    Tcp(tokio_tungstenite::WebSocketStream<Box<dyn Conn>>),
     Upgraded(tokio_tungstenite::WebSocketStream<hyper::upgrade::Upgraded>),
 }
 
-pub async fn handshake_tcp(socket: tokio::net::TcpStream) -> Result<(WebSocket, Version)> {
-    let mut version = None;
+#[derive(Debug, Copy, Clone)]
+enum Subproto {
+    Hrana1,
+    Hrana2,
+    Hrana3,
+    Hrana3Protobuf,
+}
+
+pub struct Output {
+    pub ws: WebSocket,
+    pub version: Version,
+    pub encoding: Encoding,
+    pub namespace: NamespaceName,
+}
+
+pub async fn handshake_tcp(
+    socket: Box<dyn Conn>,
+    disable_default_ns: bool,
+    disable_namespaces: bool,
+) -> Result<Output> {
+    let mut subproto = None;
+    let mut namespace = None;
     let callback = |req: &http::Request<()>, resp: http::Response<()>| {
         let (mut resp_parts, _) = resp.into_parts();
         resp_parts
             .headers
             .insert("server", http::HeaderValue::from_static("sqld-hrana-tcp"));
 
-        match negotiate_version(req.headers(), &mut resp_parts.headers) {
-            Ok(version_) => {
-                version = Some(version_);
+        namespace =
+            match namespace_from_headers(req.headers(), disable_default_ns, disable_namespaces) {
+                Ok(ns) => Some(ns),
+                Err(e) => return Err(http::Response::from_parts(resp_parts, Some(e.to_string()))),
+            };
+
+        match negotiate_subproto(req.headers(), &mut resp_parts.headers) {
+            Ok(subproto_) => {
+                subproto = Some(subproto_);
                 Ok(http::Response::from_parts(resp_parts, ()))
             }
             Err(resp_body) => Err(http::Response::from_parts(resp_parts, Some(resp_body))),
@@ -32,16 +61,29 @@ pub async fn handshake_tcp(socket: tokio::net::TcpStream) -> Result<(WebSocket, 
     let ws_config = Some(get_ws_config());
     let stream =
         tokio_tungstenite::accept_hdr_async_with_config(socket, callback, ws_config).await?;
-    Ok((WebSocket::Tcp(stream), version.unwrap()))
+
+    let (version, encoding) = subproto.unwrap().version_encoding();
+    Ok(Output {
+        ws: WebSocket::Tcp(stream),
+        version,
+        encoding,
+        namespace: namespace.unwrap(),
+    })
 }
 
-pub async fn handshake_upgrade(upgrade: Upgrade) -> Result<(WebSocket, Version)> {
+pub async fn handshake_upgrade(
+    upgrade: Upgrade,
+    disable_default_ns: bool,
+    disable_namespaces: bool,
+) -> Result<Output> {
     let mut req = upgrade.request;
 
+    let namespace = namespace_from_headers(req.headers(), disable_default_ns, disable_namespaces)?;
     let ws_config = Some(get_ws_config());
-    let (mut resp, stream_fut_version_res) = match hyper_tungstenite::upgrade(&mut req, ws_config) {
-        Ok((mut resp, stream_fut)) => match negotiate_version(req.headers(), resp.headers_mut()) {
-            Ok(version) => (resp, Ok((stream_fut, version))),
+    let (mut resp, stream_fut_subproto_res) = match hyper_tungstenite::upgrade(&mut req, ws_config)
+    {
+        Ok((mut resp, stream_fut)) => match negotiate_subproto(req.headers(), resp.headers_mut()) {
+            Ok(subproto) => (resp, Ok((stream_fut, subproto))),
             Err(msg) => {
                 *resp.status_mut() = http::StatusCode::BAD_REQUEST;
                 *resp.body_mut() = hyper::Body::from(msg.clone());
@@ -71,49 +113,79 @@ pub async fn handshake_upgrade(upgrade: Upgrade) -> Result<(WebSocket, Version)>
         bail!("Could not send the HTTP upgrade response")
     }
 
-    let (stream_fut, version) = stream_fut_version_res?;
+    let (stream_fut, subproto) = stream_fut_subproto_res?;
     let stream = stream_fut
         .await
         .context("Could not upgrade HTTP request to a WebSocket")?;
-    Ok((WebSocket::Upgraded(stream), version))
+
+    let (version, encoding) = subproto.version_encoding();
+    Ok(Output {
+        ws: WebSocket::Upgraded(stream),
+        version,
+        encoding,
+        namespace,
+    })
 }
 
-fn negotiate_version(
+fn negotiate_subproto(
     req_headers: &http::HeaderMap,
     resp_headers: &mut http::HeaderMap,
-) -> Result<Version, String> {
+) -> Result<Subproto, String> {
     if let Some(protocol_hdr) = req_headers.get("sec-websocket-protocol") {
-        let supported_by_client = protocol_hdr
+        let client_subprotos = protocol_hdr
             .to_str()
             .unwrap_or("")
             .split(',')
-            .map(|p| p.trim());
+            .map(|p| p.trim())
+            .collect::<Vec<_>>();
 
-        let mut hrana1_supported = false;
-        let mut hrana2_supported = false;
-        for protocol_str in supported_by_client {
-            hrana1_supported |= protocol_str.eq_ignore_ascii_case("hrana1");
-            hrana2_supported |= protocol_str.eq_ignore_ascii_case("hrana2");
-        }
+        let server_subprotos = [
+            Subproto::Hrana3Protobuf,
+            Subproto::Hrana3,
+            Subproto::Hrana2,
+            Subproto::Hrana1,
+        ];
 
-        let version = if hrana2_supported {
-            Version::Hrana2
-        } else if hrana1_supported {
-            Version::Hrana1
-        } else {
-            return Err("Only 'hrana1' and 'hrana2' subprotocols are supported".into());
+        let Some(subproto) = select_subproto(&client_subprotos, &server_subprotos) else {
+            let supported = server_subprotos
+                .iter()
+                .copied()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            return Err(format!(
+                "Only these WebSocket subprotocols are supported: {}",
+                supported
+            ));
         };
+
+        tracing::debug!(
+            "Client subprotocols {:?}, selected {:?}",
+            client_subprotos,
+            subproto
+        );
 
         resp_headers.append(
             "sec-websocket-protocol",
-            http::HeaderValue::from_str(&version.to_string()).unwrap(),
+            http::HeaderValue::from_str(subproto.as_str()).unwrap(),
         );
-        Ok(version)
+        Ok(subproto)
     } else {
         // Sec-WebSocket-Protocol header not present, assume that the client wants hrana1
         // According to RFC 6455, we must not set the Sec-WebSocket-Protocol response header
-        Ok(Version::Hrana1)
+        Ok(Subproto::Hrana1)
     }
+}
+
+fn select_subproto(client_subprotos: &[&str], server_subprotos: &[Subproto]) -> Option<Subproto> {
+    for &server_subproto in server_subprotos.iter() {
+        for client_subproto in client_subprotos.iter() {
+            if client_subproto.eq_ignore_ascii_case(server_subproto.as_str()) {
+                return Some(server_subproto);
+            }
+        }
+    }
+    None
 }
 
 fn get_ws_config() -> tungstenite::protocol::WebSocketConfig {
@@ -135,6 +207,26 @@ impl WebSocket {
         match self {
             Self::Tcp(stream) => stream.send(msg).await,
             Self::Upgraded(stream) => stream.send(msg).await,
+        }
+    }
+}
+
+impl Subproto {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Hrana1 => "hrana1",
+            Self::Hrana2 => "hrana2",
+            Self::Hrana3 => "hrana3",
+            Self::Hrana3Protobuf => "hrana3-protobuf",
+        }
+    }
+
+    fn version_encoding(self) -> (Version, Encoding) {
+        match self {
+            Self::Hrana1 => (Version::Hrana1, Encoding::Json),
+            Self::Hrana2 => (Version::Hrana2, Encoding::Json),
+            Self::Hrana3 => (Version::Hrana3, Encoding::Json),
+            Self::Hrana3Protobuf => (Version::Hrana3, Encoding::Protobuf),
         }
     }
 }

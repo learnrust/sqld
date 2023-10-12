@@ -1,36 +1,43 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
-use tokio::sync::{mpsc, watch};
+use hyper::http;
+use tokio::sync::{watch, Notify};
 use tokio::time::timeout;
+use tokio::time::Duration;
 use tower::{Layer, Service};
 
 #[derive(Clone)]
-pub struct IdleShutdownLayer {
+pub struct IdleShutdownKicker {
     watcher: Arc<watch::Sender<()>>,
+    connected_replicas: Arc<AtomicUsize>,
 }
 
-impl IdleShutdownLayer {
-    pub fn new(idle_timeout: Duration, shutdown_notifier: mpsc::Sender<()>) -> Self {
+impl IdleShutdownKicker {
+    pub fn new(
+        idle_timeout: Duration,
+        initial_idle_timeout: Option<Duration>,
+        shutdown_notifier: Arc<Notify>,
+    ) -> Self {
         let (sender, mut receiver) = watch::channel(());
+        let connected_replicas = Arc::new(AtomicUsize::new(0));
+        let connected_replicas_clone = connected_replicas.clone();
+        let mut sleep_time = initial_idle_timeout.unwrap_or(idle_timeout);
         tokio::spawn(async move {
             loop {
                 // FIXME: if we measure that this is causing performance issues, we may want to
                 // implement some debouncing.
-                let timeout_fut = timeout(idle_timeout, receiver.changed());
-                match timeout_fut.await {
-                    Ok(Ok(_)) => continue,
-                    Ok(Err(_)) => break,
-                    Err(_) => {
-                        tracing::info!(
-                            "Idle timeout, no new connection in {idle_timeout:.0?}. Shutting down.",
-                        );
-                        shutdown_notifier
-                            .send(())
-                            .await
-                            .expect("failed to shutdown gracefully");
-                    }
+                let timeout_res = timeout(sleep_time, receiver.changed()).await;
+                if let Ok(Err(_)) = timeout_res {
+                    break;
                 }
+                if timeout_res.is_err() && connected_replicas_clone.load(Ordering::SeqCst) == 0 {
+                    tracing::info!(
+                        "Idle timeout, no new connection in {sleep_time:.0?}. Shutting down.",
+                    );
+                    shutdown_notifier.notify_waiters();
+                }
+                sleep_time = idle_timeout;
             }
 
             tracing::debug!("idle shutdown loop exited");
@@ -38,7 +45,16 @@ impl IdleShutdownLayer {
 
         Self {
             watcher: Arc::new(sender),
+            connected_replicas,
         }
+    }
+
+    pub fn add_connected_replica(&mut self) {
+        self.connected_replicas.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn remove_connected_replica(&mut self) {
+        self.connected_replicas.fetch_sub(1, Ordering::SeqCst);
     }
 
     pub fn into_kicker(self) -> IdleKicker {
@@ -48,7 +64,7 @@ impl IdleShutdownLayer {
     }
 }
 
-impl<S> Layer<S> for IdleShutdownLayer {
+impl<S> Layer<S> for IdleShutdownKicker {
     type Service = IdleShutdownService<S>;
 
     fn layer(&self, inner: S) -> Self::Service {
@@ -76,9 +92,9 @@ pub struct IdleShutdownService<S> {
     watcher: Arc<watch::Sender<()>>,
 }
 
-impl<Req, S> Service<Req> for IdleShutdownService<S>
+impl<B, S> Service<http::request::Request<B>> for IdleShutdownService<S>
 where
-    S: Service<Req>,
+    S: Service<http::request::Request<B>>,
 {
     type Response = S::Response;
 
@@ -93,8 +109,14 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, req: Req) -> Self::Future {
-        let _ = self.watcher.send(());
+    fn call(&mut self, req: http::request::Request<B>) -> Self::Future {
+        if should_extend_lifetime(req.uri().path()) {
+            let _ = self.watcher.send(());
+        }
         self.inner.call(req)
     }
+}
+
+fn should_extend_lifetime(path: &str) -> bool {
+    path != "/health"
 }

@@ -6,12 +6,14 @@ use std::cmp::Reverse;
 use std::collections::{HashMap, VecDeque};
 use std::future::Future as _;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::{future, mem, task};
 use tokio::time::{Duration, Instant};
 
+use crate::connection::{Connection, MakeConnection};
+
 use super::super::ProtocolError;
 use super::Server;
-use crate::database::Database;
 
 /// Mutable state related to streams, owned by [`Server`] and protected with a mutex.
 pub struct ServerStreamState<D> {
@@ -32,7 +34,8 @@ pub struct ServerStreamState<D> {
 }
 
 /// Handle to a stream, owned by the [`ServerStreamState`].
-enum Handle<D> {
+#[derive(Debug)]
+pub(crate) enum Handle<D> {
     /// A stream that is open and ready to be used by requests. [`Stream::db`] should always be
     /// `Some`.
     Available(Box<Stream<D>>),
@@ -49,10 +52,11 @@ enum Handle<D> {
 ///
 /// The stream is either owned by [`Handle::Available`] (when it's not in use) or by [`Guard`]
 /// (when it's being used by a request).
-struct Stream<D> {
+#[derive(Debug)]
+pub(crate) struct Stream<D> {
     /// The database connection that corresponds to this stream. This is `None` after the `"close"`
     /// request was executed.
-    db: Option<D>,
+    pub(crate) db: Option<Arc<D>>,
     /// The cache of SQL texts stored on the server with `"store_sql"` requests.
     sqls: HashMap<i32, String>,
     /// Stream id of this stream. The id is generated randomly (it should be unguessable).
@@ -96,12 +100,17 @@ impl<D> ServerStreamState<D> {
             expire_round_base: Instant::now(),
         }
     }
+
+    pub(crate) fn handles(&self) -> &HashMap<u64, Handle<D>> {
+        &self.handles
+    }
 }
 
 /// Acquire a guard to a new or existing stream. If baton is `Some`, we try to look up the stream,
 /// otherwise we create a new stream.
-pub async fn acquire<'srv, D: Database>(
+pub async fn acquire<'srv, D: Connection>(
     server: &'srv Server<D>,
+    connection_maker: Arc<dyn MakeConnection<Connection = D>>,
     baton: Option<&str>,
 ) -> Result<Guard<'srv, D>> {
     let stream = match baton {
@@ -133,7 +142,8 @@ pub async fn acquire<'srv, D: Database>(
                 }
             };
 
-            let Handle::Available(mut stream) = mem::replace(handle.unwrap(), Handle::Acquired) else {
+            let Handle::Available(mut stream) = mem::replace(handle.unwrap(), Handle::Acquired)
+            else {
                 unreachable!()
             };
 
@@ -145,15 +155,11 @@ pub async fn acquire<'srv, D: Database>(
             stream
         }
         None => {
-            let db = server
-                .db_factory
-                .create()
-                .await
-                .context("Could not create a database connection")?;
+            let db = connection_maker.create().await?;
 
             let mut state = server.stream_state.lock();
             let stream = Box::new(Stream {
-                db: Some(db),
+                db: Some(Arc::new(db)),
                 sqls: HashMap::new(),
                 stream_id: gen_stream_id(&mut state),
                 // initializing the sequence number randomly makes it much harder to exploit
@@ -176,10 +182,15 @@ pub async fn acquire<'srv, D: Database>(
     })
 }
 
-impl<'srv, D: Database> Guard<'srv, D> {
+impl<'srv, D: Connection> Guard<'srv, D> {
     pub fn get_db(&self) -> Result<&D, ProtocolError> {
         let stream = self.stream.as_ref().unwrap();
-        stream.db.as_ref().ok_or(ProtocolError::BatonStreamClosed)
+        stream.db.as_deref().ok_or(ProtocolError::BatonStreamClosed)
+    }
+
+    pub fn get_db_owned(&self) -> Result<Arc<D>, ProtocolError> {
+        let stream = self.stream.as_ref().unwrap();
+        stream.db.clone().ok_or(ProtocolError::BatonStreamClosed)
     }
 
     /// Closes the database connection. The next call to [`Guard::release()`] will then remove the
@@ -222,8 +233,10 @@ impl<'srv, D> Drop for Guard<'srv, D> {
 
         let mut state = self.server.stream_state.lock();
         let Some(handle) = state.handles.remove(&stream_id) else {
-            panic!("Dropped a Guard for stream {stream_id}, \
-                but Server does not contain a handle to it");
+            panic!(
+                "Dropped a Guard for stream {stream_id}, \
+                but Server does not contain a handle to it"
+            );
         };
         if !matches!(handle, Handle::Acquired) {
             panic!(
@@ -242,7 +255,7 @@ impl<'srv, D> Drop for Guard<'srv, D> {
     }
 }
 
-fn gen_stream_id(state: &mut ServerStreamState<impl Database>) -> u64 {
+fn gen_stream_id(state: &mut ServerStreamState<impl Connection>) -> u64 {
     for _ in 0..10 {
         let stream_id = rand::random();
         if !state.handles.contains_key(&stream_id) {

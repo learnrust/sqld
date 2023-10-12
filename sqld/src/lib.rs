@@ -1,568 +1,236 @@
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::{Path, PathBuf};
-use std::sync::mpsc::RecvTimeoutError;
-use std::sync::Arc;
-use std::time::Duration;
+#![allow(clippy::type_complexity, clippy::too_many_arguments)]
 
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::str::FromStr;
+use std::sync::{Arc, Weak};
+
+use crate::auth::Auth;
+use crate::connection::{Connection, MakeConnection};
+use crate::error::Error;
+use crate::migration::maybe_migrate;
+use crate::net::Accept;
+use crate::rpc::proxy::rpc::proxy_server::Proxy;
+use crate::rpc::proxy::ProxyService;
+use crate::rpc::replica_proxy::ReplicaProxyService;
+use crate::rpc::replication_log::rpc::replication_log_server::ReplicationLog;
+use crate::rpc::replication_log::ReplicationLogService;
+use crate::rpc::replication_log_proxy::ReplicationLogProxyService;
+use crate::rpc::run_rpc_server;
+use crate::stats::Stats;
 use anyhow::Context as AnyhowContext;
-use futures::never::Never;
-use libsql::wal_hook::TRANSPARENT_METHODS;
+use config::{
+    AdminApiConfig, DbConfig, HeartbeatConfig, RpcClientConfig, RpcServerConfig, UserApiConfig,
+};
+use http::user::UserApi;
+use hyper::client::HttpConnector;
+use hyper_rustls::HttpsConnector;
+use namespace::{
+    MakeNamespace, NamespaceName, NamespaceStore, PrimaryNamespaceConfig, PrimaryNamespaceMaker,
+    ReplicaNamespaceConfig, ReplicaNamespaceMaker,
+};
+use net::Connector;
 use once_cell::sync::Lazy;
-use rpc::run_rpc_server;
+use replication::NamespacedSnapshotCallback;
+pub use sqld_libsql_bindings as libsql_bindings;
+use tokio::runtime::Runtime;
 use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinSet;
-use tonic::transport::Channel;
-use utils::services::idle_shutdown::IdleShutdownLayer;
+use tokio::time::Duration;
+use url::Url;
+use utils::services::idle_shutdown::IdleShutdownKicker;
 
-use self::database::config::DatabaseConfigStore;
-use self::database::dump::loader::DumpLoader;
-use self::database::factory::DbFactory;
-use self::database::libsql::{open_db, LibSqlDbFactory};
-use self::database::write_proxy::WriteProxyDbFactory;
-use self::database::Database;
-use self::replication::primary::logger::{ReplicationLoggerHookCtx, REPLICATION_METHODS};
-use self::replication::ReplicationLogger;
-use crate::auth::Auth;
-use crate::error::Error;
-use crate::replication::replica::Replicator;
-use crate::stats::Stats;
+use self::net::AddrIncoming;
 
-use sha256::try_digest;
+pub mod config;
+pub mod connection;
+pub mod net;
+pub mod rpc;
+pub mod version;
 
-pub use sqld_libsql_bindings as libsql;
-
-mod admin_api;
 mod auth;
-pub mod database;
+mod database;
 mod error;
+mod h2c;
 mod heartbeat;
 mod hrana;
 mod http;
+mod migration;
+mod namespace;
 mod query;
 mod query_analysis;
 mod query_result_builder;
 mod replication;
-pub mod rpc;
 mod stats;
 #[cfg(test)]
 mod test;
 mod utils;
-pub mod version;
 
-const MAX_CONCCURENT_DBS: usize = 128;
+const MAX_CONCURRENT_DBS: usize = 128;
 const DB_CREATE_TIMEOUT: Duration = Duration::from_secs(1);
+const DEFAULT_AUTO_CHECKPOINT: u32 = 1000;
+const LIBSQL_PAGE_SIZE: u64 = 4096;
 
-#[derive(clap::ValueEnum, Clone, Debug, PartialEq)]
-pub enum Backend {
-    Libsql,
-}
+pub(crate) static BLOCKING_RT: Lazy<Runtime> = Lazy::new(|| {
+    tokio::runtime::Builder::new_multi_thread()
+        .max_blocking_threads(50_000)
+        .enable_all()
+        .build()
+        .unwrap()
+});
 
 type Result<T, E = Error> = std::result::Result<T, E>;
+type StatsSender = mpsc::Sender<(NamespaceName, Weak<Stats>)>;
 
-/// Trigger a hard database reset. This cause the database to be wiped, freshly restarted
-/// This is used for replicas that are left in an unrecoverabe state and should restart from a
-/// fresh state.
-///
-/// /!\ use with caution.
-pub(crate) static HARD_RESET: Lazy<Arc<Notify>> = Lazy::new(|| Arc::new(Notify::new()));
-
-#[derive(Debug, Clone)]
-pub struct Config {
-    pub db_path: PathBuf,
-    pub extensions_path: Option<PathBuf>,
-    pub http_addr: Option<SocketAddr>,
-    pub enable_http_console: bool,
-    pub http_auth: Option<String>,
-    pub http_self_url: Option<String>,
-    pub hrana_addr: Option<SocketAddr>,
-    pub admin_addr: Option<SocketAddr>,
-    pub auth_jwt_key: Option<String>,
-    pub backend: Backend,
-    pub writer_rpc_addr: Option<String>,
-    pub writer_rpc_tls: bool,
-    pub writer_rpc_cert: Option<PathBuf>,
-    pub writer_rpc_key: Option<PathBuf>,
-    pub writer_rpc_ca_cert: Option<PathBuf>,
-    pub rpc_server_addr: Option<SocketAddr>,
-    pub rpc_server_tls: bool,
-    pub rpc_server_cert: Option<PathBuf>,
-    pub rpc_server_key: Option<PathBuf>,
-    pub rpc_server_ca_cert: Option<PathBuf>,
-    #[cfg(feature = "bottomless")]
-    pub bottomless_replication: Option<bottomless::replicator::Options>,
+pub struct Server<C = HttpConnector, A = AddrIncoming, D = HttpsConnector<HttpConnector>> {
+    pub path: Arc<Path>,
+    pub db_config: DbConfig,
+    pub user_api_config: UserApiConfig<A>,
+    pub admin_api_config: Option<AdminApiConfig<A, D>>,
+    pub rpc_server_config: Option<RpcServerConfig<A>>,
+    pub rpc_client_config: Option<RpcClientConfig<C>>,
     pub idle_shutdown_timeout: Option<Duration>,
-    pub load_from_dump: Option<PathBuf>,
-    pub max_log_size: u64,
-    pub heartbeat_url: Option<String>,
-    pub heartbeat_auth: Option<String>,
-    pub heartbeat_period: Duration,
-    pub soft_heap_limit_mb: Option<usize>,
-    pub hard_heap_limit_mb: Option<usize>,
-    pub allow_replica_overwrite: bool,
-    pub max_response_size: u64,
+    pub initial_idle_shutdown_timeout: Option<Duration>,
+    pub disable_default_namespace: bool,
+    pub heartbeat_config: Option<HeartbeatConfig>,
+    pub disable_namespaces: bool,
+    pub shutdown: Arc<Notify>,
 }
 
-impl Default for Config {
+impl<C, A, D> Default for Server<C, A, D> {
     fn default() -> Self {
-        Config {
-            db_path: "data.sqld".into(),
-            extensions_path: None,
-            http_addr: Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080)),
-            enable_http_console: false,
-            http_auth: None,
-            http_self_url: None,
-            hrana_addr: None,
-            admin_addr: None,
-            auth_jwt_key: None,
-            backend: Backend::Libsql,
-            writer_rpc_addr: None,
-            writer_rpc_tls: false,
-            writer_rpc_cert: None,
-            writer_rpc_key: None,
-            writer_rpc_ca_cert: None,
-            rpc_server_addr: None,
-            rpc_server_tls: false,
-            rpc_server_cert: None,
-            rpc_server_key: None,
-            rpc_server_ca_cert: None,
-            #[cfg(feature = "bottomless")]
-            bottomless_replication: None,
-            idle_shutdown_timeout: None,
-            load_from_dump: None,
-            max_log_size: 200,
-            heartbeat_url: None,
-            heartbeat_auth: None,
-            heartbeat_period: Duration::from_secs(30),
-            soft_heap_limit_mb: None,
-            hard_heap_limit_mb: None,
-            allow_replica_overwrite: false,
-            max_response_size: 10 * 1024 * 1024, // 10MiB
+        Self {
+            path: PathBuf::from("data.sqld").into(),
+            db_config: Default::default(),
+            user_api_config: Default::default(),
+            admin_api_config: Default::default(),
+            rpc_server_config: Default::default(),
+            rpc_client_config: Default::default(),
+            idle_shutdown_timeout: Default::default(),
+            initial_idle_shutdown_timeout: Default::default(),
+            disable_default_namespace: false,
+            heartbeat_config: Default::default(),
+            disable_namespaces: true,
+            shutdown: Default::default(),
         }
     }
 }
 
-async fn run_service<D: Database>(
-    db_factory: Arc<dyn DbFactory<Db = D>>,
-    config: &Config,
-    join_set: &mut JoinSet<anyhow::Result<()>>,
-    idle_shutdown_layer: Option<IdleShutdownLayer>,
-    stats: Stats,
-    db_config_store: Arc<DatabaseConfigStore>,
-) -> anyhow::Result<()> {
-    let auth = get_auth(config)?;
-
-    let (hrana_accept_tx, hrana_accept_rx) = mpsc::channel(8);
-    let (hrana_upgrade_tx, hrana_upgrade_rx) = mpsc::channel(8);
-
-    if config.http_addr.is_some() || config.hrana_addr.is_some() {
-        let db_factory = db_factory.clone();
-        let auth = auth.clone();
-        let idle_kicker = idle_shutdown_layer.clone().map(|isl| isl.into_kicker());
-        join_set.spawn(async move {
-            hrana::ws::serve(
-                db_factory,
-                auth,
-                idle_kicker,
-                hrana_accept_rx,
-                hrana_upgrade_rx,
-            )
-            .await
-            .context("Hrana server failed")
-        });
-    }
-
-    if let Some(addr) = config.http_addr {
-        let hrana_http_srv = Arc::new(hrana::http::Server::new(
-            db_factory.clone(),
-            config.http_self_url.clone(),
-        ));
-        join_set.spawn(http::run_http(
-            addr,
-            auth,
-            db_factory,
-            hrana_upgrade_tx,
-            hrana_http_srv.clone(),
-            config.enable_http_console,
-            idle_shutdown_layer,
-            stats.clone(),
-        ));
-        join_set.spawn(async move {
-            hrana_http_srv.run_expire().await;
-            Ok(())
-        });
-    }
-
-    if let Some(addr) = config.hrana_addr {
-        join_set.spawn(async move {
-            hrana::ws::listen(addr, hrana_accept_tx)
-                .await
-                .context("Hrana listener failed")
-        });
-    }
-
-    if let Some(addr) = config.admin_addr {
-        join_set.spawn(admin_api::run_admin_api(addr, db_config_store));
-    }
-
-    match &config.heartbeat_url {
-        Some(heartbeat_url) => {
-            let heartbeat_period = config.heartbeat_period;
-            tracing::info!(
-                "Server sending heartbeat to URL {} every {:?}",
-                heartbeat_url,
-                heartbeat_period,
-            );
-            let heartbeat_url = heartbeat_url.clone();
-            let heartbeat_auth = config.heartbeat_auth.clone();
-            join_set.spawn(async move {
-                heartbeat::server_heartbeat(
-                    heartbeat_url,
-                    heartbeat_auth,
-                    heartbeat_period,
-                    stats.clone(),
-                )
-                .await;
-                Ok(())
-            });
-        }
-        None => {
-            tracing::warn!("No server heartbeat configured")
-        }
-    }
-
-    Ok(())
+struct Services<M: MakeNamespace, A, P, S, C> {
+    namespaces: NamespaceStore<M>,
+    idle_shutdown_kicker: Option<IdleShutdownKicker>,
+    proxy_service: P,
+    replication_service: S,
+    user_api_config: UserApiConfig<A>,
+    admin_api_config: Option<AdminApiConfig<A, C>>,
+    disable_namespaces: bool,
+    disable_default_namespace: bool,
+    db_config: DbConfig,
+    auth: Arc<Auth>,
+    path: Arc<Path>,
 }
 
-fn get_auth(config: &Config) -> anyhow::Result<Arc<Auth>> {
-    let mut auth = Auth::default();
+impl<M, A, P, S, C> Services<M, A, P, S, C>
+where
+    M: MakeNamespace,
+    A: crate::net::Accept,
+    P: Proxy,
+    S: ReplicationLog,
+    C: Connector,
+{
+    fn configure(self, join_set: &mut JoinSet<anyhow::Result<()>>) {
+        let user_http = UserApi {
+            http_acceptor: self.user_api_config.http_acceptor,
+            hrana_ws_acceptor: self.user_api_config.hrana_ws_acceptor,
+            auth: self.auth,
+            namespaces: self.namespaces.clone(),
+            idle_shutdown_kicker: self.idle_shutdown_kicker.clone(),
+            proxy_service: self.proxy_service,
+            replication_service: self.replication_service,
+            disable_default_namespace: self.disable_default_namespace,
+            disable_namespaces: self.disable_namespaces,
+            max_response_size: self.db_config.max_response_size,
+            enable_console: self.user_api_config.enable_http_console,
+            self_url: self.user_api_config.self_url,
+            path: self.path.clone(),
+        };
 
-    if let Some(arg) = config.http_auth.as_deref() {
-        if let Some(param) = auth::parse_http_basic_auth_arg(arg)? {
-            auth.http_basic = Some(param);
-            tracing::info!("Using legacy HTTP basic authentication");
-        }
-    }
+        let user_http_service = user_http.configure(join_set);
 
-    if let Some(jwt_key) = config.auth_jwt_key.as_deref() {
-        let jwt_key = auth::parse_jwt_key(jwt_key).context("Could not parse JWT decoding key")?;
-        auth.jwt_key = Some(jwt_key);
-        tracing::info!("Using JWT-based authentication");
-    }
-
-    auth.disabled = auth.http_basic.is_none() && auth.jwt_key.is_none();
-    if auth.disabled {
-        tracing::warn!("No authentication specified, the server will not require authentication")
-    }
-
-    Ok(Arc::new(auth))
-}
-
-/// nukes current DB and start anew
-async fn hard_reset(
-    config: &Config,
-    mut join_set: JoinSet<anyhow::Result<()>>,
-) -> anyhow::Result<()> {
-    tracing::error!("received hard-reset command: reseting replica.");
-
-    tracing::info!("Shutting down all services...");
-    join_set.shutdown().await;
-    tracing::info!("All services have been shut down.");
-
-    let db_path = &config.db_path;
-    tokio::fs::remove_dir_all(db_path).await?;
-
-    Ok(())
-}
-
-fn configure_rpc(config: &Config) -> anyhow::Result<(Channel, tonic::transport::Uri)> {
-    let mut endpoint = Channel::from_shared(config.writer_rpc_addr.clone().unwrap())?;
-    if config.writer_rpc_tls {
-        let cert_pem = std::fs::read_to_string(config.writer_rpc_cert.clone().unwrap())?;
-        let key_pem = std::fs::read_to_string(config.writer_rpc_key.clone().unwrap())?;
-        let identity = tonic::transport::Identity::from_pem(cert_pem, key_pem);
-
-        let ca_cert_pem = std::fs::read_to_string(config.writer_rpc_ca_cert.clone().unwrap())?;
-        let ca_cert = tonic::transport::Certificate::from_pem(ca_cert_pem);
-
-        let tls_config = tonic::transport::ClientTlsConfig::new()
-            .identity(identity)
-            .ca_certificate(ca_cert)
-            .domain_name("sqld");
-        endpoint = endpoint.tls_config(tls_config)?;
-    }
-
-    let channel = endpoint.connect_lazy();
-    let uri = tonic::transport::Uri::from_maybe_shared(config.writer_rpc_addr.clone().unwrap())?;
-
-    Ok((channel, uri))
-}
-
-async fn start_replica(
-    config: &Config,
-    join_set: &mut JoinSet<anyhow::Result<()>>,
-    idle_shutdown_layer: Option<IdleShutdownLayer>,
-    stats: Stats,
-    db_config_store: Arc<DatabaseConfigStore>,
-) -> anyhow::Result<()> {
-    let (channel, uri) = configure_rpc(config)?;
-    let replicator = Replicator::new(
-        config.db_path.clone(),
-        channel.clone(),
-        uri.clone(),
-        config.allow_replica_overwrite,
-    )?;
-    let applied_frame_no_receiver = replicator.current_frame_no_notifier.clone();
-
-    join_set.spawn(replicator.run());
-
-    let valid_extensions = validate_extensions(config.extensions_path.clone())?;
-
-    let factory = WriteProxyDbFactory::new(
-        config.db_path.clone(),
-        valid_extensions,
-        channel,
-        uri,
-        stats.clone(),
-        db_config_store.clone(),
-        applied_frame_no_receiver,
-        config.max_response_size,
-    )
-    .throttled(MAX_CONCCURENT_DBS, Some(DB_CREATE_TIMEOUT));
-
-    run_service(
-        Arc::new(factory),
-        config,
-        join_set,
-        idle_shutdown_layer,
-        stats,
-        db_config_store,
-    )
-    .await?;
-
-    Ok(())
-}
-
-fn check_fresh_db(path: &Path) -> bool {
-    !path.join("wallog").exists()
-}
-
-fn validate_extensions(extensions_path: Option<PathBuf>) -> anyhow::Result<Vec<PathBuf>> {
-    let mut valid_extensions = vec![];
-    if let Some(ext_dir) = extensions_path {
-        let extensions_list = ext_dir.join("trusted.lst");
-
-        let file_contents = std::fs::read_to_string(&extensions_list)
-            .with_context(|| format!("can't read {}", &extensions_list.display()))?;
-
-        let extensions = file_contents.lines().filter(|c| !c.is_empty());
-
-        for line in extensions {
-            let mut ext_info = line.trim().split_ascii_whitespace();
-
-            let ext_sha = ext_info.next().ok_or_else(|| {
-                anyhow::anyhow!("invalid line on {}: {}", &extensions_list.display(), line)
-            })?;
-            let ext_fname = ext_info.next().ok_or_else(|| {
-                anyhow::anyhow!("invalid line on {}: {}", &extensions_list.display(), line)
-            })?;
-
-            anyhow::ensure!(
-                ext_info.next().is_none(),
-                "extension list seem to contain a filename with whitespaces. Rejected"
-            );
-
-            let extension_full_path = ext_dir.join(ext_fname);
-            let digest = try_digest(extension_full_path.as_path()).with_context(|| {
-                format!(
-                    "Failed to get sha256 digest, while trying to read {}",
-                    extension_full_path.display()
-                )
-            })?;
-
-            anyhow::ensure!(
-                digest == ext_sha,
-                "sha256 differs for {}. Got {}",
-                ext_fname,
-                digest
-            );
-            valid_extensions.push(extension_full_path);
-        }
-    }
-    Ok(valid_extensions)
-}
-
-#[cfg(feature = "bottomless")]
-pub async fn init_bottomless_replicator(
-    path: impl AsRef<std::path::Path>,
-    options: bottomless::replicator::Options,
-) -> anyhow::Result<bottomless::replicator::Replicator> {
-    tracing::debug!("Initializing bottomless replication");
-    let path = path
-        .as_ref()
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("Invalid db path"))?
-        .to_owned();
-    let mut replicator = bottomless::replicator::Replicator::with_options(path, options).await?;
-
-    match replicator.restore(None, None).await? {
-        bottomless::replicator::RestoreAction::None => (),
-        bottomless::replicator::RestoreAction::SnapshotMainDbFile => {
-            replicator.new_generation();
-            replicator.snapshot_main_db_file().await?;
-            // Restoration process only leaves the local WAL file if it was
-            // detected to be newer than its remote counterpart.
-            replicator.maybe_replicate_wal().await?
-        }
-        bottomless::replicator::RestoreAction::ReuseGeneration(gen) => {
-            replicator.set_generation(gen);
-        }
-    }
-
-    Ok(replicator)
-}
-
-async fn start_primary(
-    config: &Config,
-    join_set: &mut JoinSet<anyhow::Result<()>>,
-    idle_shutdown_layer: Option<IdleShutdownLayer>,
-    stats: Stats,
-    db_config_store: Arc<DatabaseConfigStore>,
-    db_is_dirty: bool,
-) -> anyhow::Result<()> {
-    let is_fresh_db = check_fresh_db(&config.db_path);
-    let logger = Arc::new(ReplicationLogger::open(
-        &config.db_path,
-        config.max_log_size,
-        db_is_dirty,
-    )?);
-
-    #[cfg(feature = "bottomless")]
-    let bottomless_replicator = if let Some(options) = &config.bottomless_replication {
-        Some(Arc::new(std::sync::Mutex::new(
-            init_bottomless_replicator(config.db_path.join("data"), options.clone()).await?,
-        )))
-    } else {
-        None
-    };
-
-    // load dump is necessary
-    let dump_loader = DumpLoader::new(
-        config.db_path.clone(),
-        logger.clone(),
-        #[cfg(feature = "bottomless")]
-        bottomless_replicator.clone(),
-    )
-    .await?;
-    if let Some(ref path) = config.load_from_dump {
-        if !is_fresh_db {
-            anyhow::bail!("cannot load from a dump if a database already exists.\nIf you're sure you want to load from a dump, delete your database folder at `{}`", config.db_path.display());
-        }
-        dump_loader.load_dump(path.into()).await?;
-    }
-
-    let valid_extensions = validate_extensions(config.extensions_path.clone())?;
-
-    let db_factory: Arc<_> = LibSqlDbFactory::new(
-        config.db_path.clone(),
-        &REPLICATION_METHODS,
+        if let Some(AdminApiConfig {
+            acceptor,
+            connector,
+        }) = self.admin_api_config
         {
-            let logger = logger.clone();
-            #[cfg(feature = "bottomless")]
-            let bottomless_replicator = bottomless_replicator.clone();
-            move || {
-                ReplicationLoggerHookCtx::new(
-                    logger.clone(),
-                    #[cfg(feature = "bottomless")]
-                    bottomless_replicator.clone(),
-                )
-            }
-        },
-        stats.clone(),
-        db_config_store.clone(),
-        valid_extensions,
-        config.max_response_size,
-    )
-    .await?
-    .throttled(MAX_CONCCURENT_DBS, Some(DB_CREATE_TIMEOUT))
-    .into();
-
-    if let Some(ref addr) = config.rpc_server_addr {
-        join_set.spawn(run_rpc_server(
-            *addr,
-            config.rpc_server_tls,
-            config.rpc_server_cert.clone(),
-            config.rpc_server_key.clone(),
-            config.rpc_server_ca_cert.clone(),
-            db_factory.clone(),
-            logger,
-            idle_shutdown_layer.clone(),
-        ));
+            join_set.spawn(http::admin::run(
+                acceptor,
+                user_http_service,
+                self.namespaces,
+                connector,
+            ));
+        }
     }
-
-    run_service(
-        db_factory,
-        config,
-        join_set,
-        idle_shutdown_layer,
-        stats,
-        db_config_store,
-    )
-    .await?;
-
-    Ok(())
 }
 
-// Periodically check the storage used by the database and save it in the Stats structure.
-// TODO: Once we have a separate fiber that does WAL checkpoints, running this routine
-// right after checkpointing is exactly where it should be done.
-async fn run_storage_monitor(db_path: PathBuf, stats: Stats) -> anyhow::Result<()> {
-    let (_drop_guard, exit_notify) = std::sync::mpsc::channel::<Never>();
-    let _ = tokio::task::spawn_blocking(move || {
-        let duration = tokio::time::Duration::from_secs(60);
-        loop {
-            // because closing the last connection interferes with opening a new one, we lazily
-            // initialize a connection here, and keep it alive for the entirety of the program. If we
-            // fail to open it, we wait for `duration` and try again later.
-            let ctx = &mut ();
-            let maybe_conn = match open_db(&db_path, &TRANSPARENT_METHODS, ctx, Some(rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)) {
-                Ok(conn) => Some(conn),
-                Err(e) => {
-                    tracing::warn!("failed to open connection for storager monitor: {e}, trying again in {duration:?}");
-                    None
-                },
-            };
+async fn run_periodic_checkpoint<C>(
+    connection_maker: Arc<C>,
+    period: Duration,
+) -> anyhow::Result<()>
+where
+    C: MakeConnection,
+{
+    use tokio::time::{interval, sleep, Instant, MissedTickBehavior};
 
-            loop {
-                if let Some(ref conn) = maybe_conn {
-                    if let Ok(storage_bytes_used) =
-                        conn.query_row("select sum(pgsize) from dbstat;", [], |row| {
-                            row.get::<usize, u64>(0)
-                        })
-                    {
-                        stats.set_storage_bytes_used(storage_bytes_used);
+    const RETRY_INTERVAL: Duration = Duration::from_secs(60);
+    tracing::info!("setting checkpoint interval to {:?}", period);
+    let mut interval = interval(period);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut retry: Option<Duration> = None;
+    loop {
+        if let Some(retry) = retry.take() {
+            if retry.is_zero() {
+                tracing::warn!("database was not set in WAL journal mode");
+                return Ok(());
+            }
+            sleep(retry).await;
+        } else {
+            interval.tick().await;
+        }
+        retry = match connection_maker.create().await {
+            Ok(conn) => {
+                if let Err(e) = conn.vacuum_if_needed().await {
+                    tracing::warn!("vacuum failed: {}", e);
+                }
+                tracing::info!("database checkpoint starts");
+                let start = Instant::now();
+                match conn.checkpoint().await {
+                    Ok(_) => {
+                        let elapsed = Instant::now() - start;
+                        if elapsed >= Duration::from_secs(10) {
+                            tracing::warn!("database checkpoint finished (took: {:?})", elapsed);
+                        } else {
+                            tracing::info!("database checkpoint finished (took: {:?})", elapsed);
+                        }
+                        None
+                    }
+                    Err(err) => {
+                        tracing::warn!("failed to execute checkpoint: {}", err);
+                        Some(RETRY_INTERVAL)
                     }
                 }
-
-                match exit_notify.recv_timeout(duration) {
-                    Ok(_) => unreachable!(),
-                    Err(RecvTimeoutError::Disconnected) => return,
-                    Err(RecvTimeoutError::Timeout) => (),
-
-                }
-
-                if maybe_conn.is_none() {
-                    break
-                }
+            }
+            Err(err) => {
+                tracing::warn!("couldn't connect: {}", err);
+                Some(RETRY_INTERVAL)
             }
         }
-    }).await;
-
-    Ok(())
+    }
 }
 
 fn sentinel_file_path(path: &Path) -> PathBuf {
     path.join(".sentinel")
 }
+
 /// initialize the sentinel file. This file is created at the beginning of the process, and is
 /// deleted at the end, on a clean exit. If the file is present when we start the process, this
 /// means that the database was not shutdown properly, and might need repair. This function return
@@ -578,111 +246,335 @@ fn init_sentinel_file(path: &Path) -> anyhow::Result<bool> {
     Ok(false)
 }
 
-pub async fn run_server(config: Config) -> anyhow::Result<()> {
-    tracing::trace!("Backend: {:?}", config.backend);
-
-    #[cfg(feature = "bottomless")]
-    if config.bottomless_replication.is_some() {
-        bottomless::static_init::register_bottomless_methods();
+fn init_version_file(db_path: &Path) -> anyhow::Result<()> {
+    // try to detect the presence of the data file at the root of db_path. If it's there, it's a
+    // pre-0.18.0 database and needs to be migrated
+    if db_path.join("data").exists() {
+        return Ok(());
     }
 
-    if let Some(soft_limit_mb) = config.soft_heap_limit_mb {
-        tracing::warn!("Setting soft heap limit to {soft_limit_mb}MiB");
-        unsafe {
-            sqld_libsql_bindings::ffi::sqlite3_soft_heap_limit64(soft_limit_mb as i64 * 1024 * 1024)
-        };
-    }
-    if let Some(hard_limit_mb) = config.hard_heap_limit_mb {
-        tracing::warn!("Setting hard heap limit to {hard_limit_mb}MiB");
-        unsafe {
-            sqld_libsql_bindings::ffi::sqlite3_hard_heap_limit64(hard_limit_mb as i64 * 1024 * 1024)
-        };
+    let version_path = db_path.join(".version");
+    if !version_path.exists() {
+        std::fs::create_dir_all(db_path)?;
+        std::fs::write(version_path, env!("CARGO_PKG_VERSION"))?;
     }
 
-    loop {
-        if !config.db_path.exists() {
-            std::fs::create_dir_all(&config.db_path)?;
+    Ok(())
+}
+
+impl<C, A, D> Server<C, A, D>
+where
+    C: Connector,
+    A: Accept,
+    D: Connector,
+{
+    /// Setup sqlite global environment
+    fn init_sqlite_globals(&self) {
+        if self.db_config.bottomless_replication.is_some() {
+            bottomless::static_init::register_bottomless_methods();
         }
+
+        if let Some(soft_limit_mb) = self.db_config.soft_heap_limit_mb {
+            tracing::warn!("Setting soft heap limit to {soft_limit_mb}MiB");
+            unsafe {
+                sqld_libsql_bindings::ffi::sqlite3_soft_heap_limit64(
+                    soft_limit_mb as i64 * 1024 * 1024,
+                )
+            };
+        }
+        if let Some(hard_limit_mb) = self.db_config.hard_heap_limit_mb {
+            tracing::warn!("Setting hard heap limit to {hard_limit_mb}MiB");
+            unsafe {
+                sqld_libsql_bindings::ffi::sqlite3_hard_heap_limit64(
+                    hard_limit_mb as i64 * 1024 * 1024,
+                )
+            };
+        }
+    }
+
+    pub fn make_snapshot_callback(&self) -> NamespacedSnapshotCallback {
+        let snapshot_exec = self.db_config.snapshot_exec.clone();
+        Arc::new(move |snapshot_file: &Path, namespace: &NamespaceName| {
+            if let Some(exec) = snapshot_exec.as_ref() {
+                let status = Command::new(exec)
+                    .arg(snapshot_file)
+                    .arg(namespace.as_str())
+                    .status()?;
+                anyhow::ensure!(
+                    status.success(),
+                    "Snapshot exec process failed with status {status}"
+                );
+            }
+            Ok(())
+        })
+    }
+
+    fn spawn_monitoring_tasks(
+        &self,
+        join_set: &mut JoinSet<anyhow::Result<()>>,
+        stats_receiver: mpsc::Receiver<(NamespaceName, Weak<Stats>)>,
+    ) -> anyhow::Result<()> {
+        match self.heartbeat_config {
+            Some(ref config) => {
+                tracing::info!(
+                    "Server sending heartbeat to URL {} every {:?}",
+                    config.heartbeat_url,
+                    config.heartbeat_period,
+                );
+                join_set.spawn({
+                    let heartbeat_auth = config.heartbeat_auth.clone();
+                    let heartbeat_period = config.heartbeat_period;
+                    let heartbeat_url =
+                        Url::from_str(&config.heartbeat_url).context("invalid heartbeat URL")?;
+                    async move {
+                        heartbeat::server_heartbeat(
+                            heartbeat_url,
+                            heartbeat_auth,
+                            heartbeat_period,
+                            stats_receiver,
+                        )
+                        .await;
+                        Ok(())
+                    }
+                });
+
+                // join_set.spawn(run_storage_monitor(self.path.clone(), stats));
+            }
+            None => {
+                tracing::warn!("No server heartbeat configured")
+            }
+        }
+
+        Ok(())
+    }
+
+    pub async fn start(self) -> anyhow::Result<()> {
         let mut join_set = JoinSet::new();
 
-        let (shutdown_sender, mut shutdown_receiver) = tokio::sync::mpsc::channel::<()>(1);
+        init_version_file(&self.path)?;
+        maybe_migrate(&self.path)?;
+        let (stats_sender, stats_receiver) = mpsc::channel(8);
+        self.spawn_monitoring_tasks(&mut join_set, stats_receiver)?;
+        self.init_sqlite_globals();
+        let db_is_dirty = init_sentinel_file(&self.path)?;
+        let idle_shutdown_kicker = self.setup_shutdown();
 
-        join_set.spawn({
-            let shutdown_sender = shutdown_sender.clone();
+        let snapshot_callback = self.make_snapshot_callback();
+        let auth = self.user_api_config.get_auth().map(Arc::new)?;
+        let extensions = self.db_config.validate_extensions()?;
+
+        match self.rpc_client_config {
+            Some(rpc_config) => {
+                let replica = Replica {
+                    rpc_config,
+                    stats_sender,
+                    extensions,
+                    db_config: self.db_config.clone(),
+                    base_path: self.path.clone(),
+                    auth: auth.clone(),
+                };
+                let (namespaces, proxy_service, replication_service) = replica.configure().await?;
+                let services = Services {
+                    namespaces,
+                    idle_shutdown_kicker,
+                    proxy_service,
+                    replication_service,
+                    user_api_config: self.user_api_config,
+                    admin_api_config: self.admin_api_config,
+                    disable_namespaces: self.disable_namespaces,
+                    disable_default_namespace: self.disable_default_namespace,
+                    db_config: self.db_config,
+                    auth,
+                    path: self.path.clone(),
+                };
+
+                services.configure(&mut join_set);
+            }
+            None => {
+                let primary = Primary {
+                    rpc_config: self.rpc_server_config,
+                    db_config: self.db_config.clone(),
+                    idle_shutdown_kicker: idle_shutdown_kicker.clone(),
+                    stats_sender,
+                    db_is_dirty,
+                    snapshot_callback,
+                    extensions,
+                    base_path: self.path.clone(),
+                    disable_namespaces: self.disable_namespaces,
+                    join_set: &mut join_set,
+                    auth: auth.clone(),
+                };
+                let (namespaces, proxy_service, replication_service) = primary.configure().await?;
+
+                let services = Services {
+                    namespaces,
+                    idle_shutdown_kicker,
+                    proxy_service,
+                    replication_service,
+                    user_api_config: self.user_api_config,
+                    admin_api_config: self.admin_api_config,
+                    disable_namespaces: self.disable_namespaces,
+                    disable_default_namespace: self.disable_default_namespace,
+                    db_config: self.db_config,
+                    auth,
+                    path: self.path.clone(),
+                };
+
+                services.configure(&mut join_set);
+            }
+        }
+
+        tokio::select! {
+            _ = self.shutdown.notified() => {
+                join_set.shutdown().await;
+                // clean shutdown, remove sentinel file
+                std::fs::remove_file(sentinel_file_path(&self.path))?;
+            }
+            Some(res) = join_set.join_next() => {
+                res??;
+            },
+            else => (),
+        }
+
+        Ok(())
+    }
+
+    fn setup_shutdown(&self) -> Option<IdleShutdownKicker> {
+        let shutdown_notify = self.shutdown.clone();
+        self.idle_shutdown_timeout.map(|d| {
+            IdleShutdownKicker::new(d, self.initial_idle_shutdown_timeout, shutdown_notify)
+        })
+    }
+}
+
+struct Primary<'a, A> {
+    rpc_config: Option<RpcServerConfig<A>>,
+    db_config: DbConfig,
+    idle_shutdown_kicker: Option<IdleShutdownKicker>,
+    stats_sender: StatsSender,
+    db_is_dirty: bool,
+    snapshot_callback: NamespacedSnapshotCallback,
+    extensions: Arc<[PathBuf]>,
+    base_path: Arc<Path>,
+    disable_namespaces: bool,
+    auth: Arc<Auth>,
+    join_set: &'a mut JoinSet<anyhow::Result<()>>,
+}
+
+impl<A> Primary<'_, A>
+where
+    A: Accept,
+{
+    async fn configure(
+        mut self,
+    ) -> anyhow::Result<(
+        NamespaceStore<PrimaryNamespaceMaker>,
+        ProxyService,
+        ReplicationLogService,
+    )> {
+        let conf = PrimaryNamespaceConfig {
+            base_path: self.base_path,
+            max_log_size: self.db_config.max_log_size,
+            db_is_dirty: self.db_is_dirty,
+            max_log_duration: self.db_config.max_log_duration.map(Duration::from_secs_f32),
+            snapshot_callback: self.snapshot_callback,
+            bottomless_replication: self.db_config.bottomless_replication,
+            extensions: self.extensions,
+            stats_sender: self.stats_sender.clone(),
+            max_response_size: self.db_config.max_response_size,
+            max_total_response_size: self.db_config.max_total_response_size,
+            checkpoint_interval: self.db_config.checkpoint_interval,
+            disable_namespace: self.disable_namespaces,
+        };
+        let factory = PrimaryNamespaceMaker::new(conf);
+        let namespaces = NamespaceStore::new(factory, false);
+
+        // eagerly load the default namespace when namespaces are disabled
+        if self.disable_namespaces {
+            namespaces
+                .create(NamespaceName::default(), namespace::RestoreOption::Latest)
+                .await?;
+        }
+
+        if let Some(config) = self.rpc_config.take() {
+            let proxy_service =
+                ProxyService::new(namespaces.clone(), None, self.disable_namespaces);
+            // Garbage collect proxy clients every 30 seconds
+            self.join_set.spawn({
+                let clients = proxy_service.clients();
+                async move {
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        rpc::proxy::garbage_collect(&mut *clients.write().await).await;
+                    }
+                }
+            });
+            self.join_set.spawn(run_rpc_server(
+                proxy_service,
+                config.acceptor,
+                config.tls_config,
+                self.idle_shutdown_kicker.clone(),
+                namespaces.clone(),
+                self.disable_namespaces,
+            ));
+        }
+
+        let logger_service = ReplicationLogService::new(
+            namespaces.clone(),
+            self.idle_shutdown_kicker,
+            Some(self.auth.clone()),
+            self.disable_namespaces,
+        );
+
+        let proxy_service =
+            ProxyService::new(namespaces.clone(), Some(self.auth), self.disable_namespaces);
+        // Garbage collect proxy clients every 30 seconds
+        self.join_set.spawn({
+            let clients = proxy_service.clients();
             async move {
                 loop {
-                    tokio::signal::ctrl_c()
-                        .await
-                        .expect("failed to listen to CTRL-C");
-                    tracing::info!(
-                        "received CTRL-C, shutting down gracefully... This may take some time"
-                    );
-                    shutdown_sender
-                        .send(())
-                        .await
-                        .expect("failed to shutdown gracefully");
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    rpc::proxy::garbage_collect(&mut *clients.write().await).await;
                 }
             }
         });
+        Ok((namespaces, proxy_service, logger_service))
+    }
+}
 
-        let db_is_dirty = init_sentinel_file(&config.db_path)?;
+struct Replica<C> {
+    rpc_config: RpcClientConfig<C>,
+    stats_sender: StatsSender,
+    extensions: Arc<[PathBuf]>,
+    db_config: DbConfig,
+    base_path: Arc<Path>,
+    auth: Arc<Auth>,
+}
 
-        let idle_shutdown_layer = config
-            .idle_shutdown_timeout
-            .map(|d| IdleShutdownLayer::new(d, shutdown_sender.clone()));
+impl<C: Connector> Replica<C> {
+    async fn configure(
+        self,
+    ) -> anyhow::Result<(
+        NamespaceStore<impl MakeNamespace>,
+        impl Proxy,
+        impl ReplicationLog,
+    )> {
+        let (channel, uri) = self.rpc_config.configure().await?;
 
-        let stats = Stats::new(&config.db_path)?;
+        let conf = ReplicaNamespaceConfig {
+            channel: channel.clone(),
+            uri: uri.clone(),
+            extensions: self.extensions.clone(),
+            stats_sender: self.stats_sender.clone(),
+            base_path: self.base_path,
+            max_response_size: self.db_config.max_response_size,
+            max_total_response_size: self.db_config.max_total_response_size,
+        };
+        let factory = ReplicaNamespaceMaker::new(conf);
+        let namespaces = NamespaceStore::new(factory, true);
+        let replication_service = ReplicationLogProxyService::new(channel.clone(), uri.clone());
+        let proxy_service = ReplicaProxyService::new(channel, uri, self.auth.clone());
 
-        let db_config_store = Arc::new(
-            DatabaseConfigStore::load(&config.db_path).context("Could not load database config")?,
-        );
-
-        match config.writer_rpc_addr {
-            Some(_) => {
-                start_replica(
-                    &config,
-                    &mut join_set,
-                    idle_shutdown_layer,
-                    stats.clone(),
-                    db_config_store,
-                )
-                .await?
-            }
-            None => {
-                start_primary(
-                    &config,
-                    &mut join_set,
-                    idle_shutdown_layer,
-                    stats.clone(),
-                    db_config_store,
-                    db_is_dirty,
-                )
-                .await?
-            }
-        }
-
-        if config.heartbeat_url.is_some() {
-            join_set.spawn(run_storage_monitor(config.db_path.clone(), stats));
-        }
-
-        let reset = HARD_RESET.clone();
-        loop {
-            tokio::select! {
-                _ = reset.notified() => {
-                    hard_reset(&config, join_set).await?;
-                    break;
-                },
-                _ = shutdown_receiver.recv() => {
-                    join_set.shutdown().await;
-                    // clean shutdown, remove sentinel file
-                    std::fs::remove_file(sentinel_file_path(&config.db_path))?;
-                    return Ok(())
-                }
-                Some(res) = join_set.join_next() => {
-                    res??;
-                },
-                else => return Ok(()),
-            }
-        }
+        Ok((namespaces, proxy_service, replication_service))
     }
 }
